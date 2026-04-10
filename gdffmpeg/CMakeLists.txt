@@ -16,7 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   │   ├── ffmpeg_player.cpp
 #   │   └── ffmpeg_player.h
 #   ├── godot-cpp/
-#   ├── openssl_build/          ← ناتج build_openssl_android.sh
+#   ├── openssl_build/          ← الناتج build_openssl_android.sh
 #   │   ├── include/openssl/
 #   │   └── lib/  (libssl.a + libcrypto.a)
 #   └── ffmpeg_build/           ← ناتج ffmpeg_build_android.sh
