@@ -1,6 +1,23 @@
 #!/bin/bash
 set -e
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ ملاحظة للمستقبل (README for Future Reference):
+# 
+# المشكلة: خطأ "relocation R_AARCH64... cannot be used against symbol"
+# السبب: تعارض بين تعليمات الـ Assembly (NEON) الخاصة بـ FFmpeg 7.0 وبين 
+#        قواعد الـ Relocation الصارمة في Android NDK r26c (أو أحدث).
+# 
+# الحل المتبع: استخدمنا "--disable-asm".
+# 
+# ما الذي يجب فعله للرجوع "للاستعمال الكامل" (استعادة الأداء):
+# 1. إذا أردت استعادة سرعة الـ Assembly (NEON)، لا تحذف "--disable-asm" فحسب،
+#    بل يجب التراجع إلى إصدار NDK أقدم (مثل r25b) حيث كانت قواعد الربط 
+#    أقل صرامة، أو تحديث FFmpeg لإصدار أحدث إذا صدر إصدار يحل هذا التعارض.
+# 2. إذا قمت بحذف "--disable-asm" مع بقاء NDK r26c، سيعود الخطأ للظهور،
+#    وهذا يعني أنك بحاجة لإعادة ضبط أعلام الـ Linker أو تحديث بيئة البناء.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FFMPEG_SRC_DIR="${SCRIPT_DIR}/ffmpeg_source"
@@ -30,6 +47,7 @@ build_abi() {
     make clean distclean 2>/dev/null || true
 
     ./configure \
+        --disable-asm \
         --prefix="${PREFIX}" --target-os=android --arch="${ARCH}" --cpu="${CPU}" \
         --enable-cross-compile --sysroot="${TOOLCHAIN}/sysroot" \
         --cc="${CC}" --cxx="${CXX}" --enable-static --disable-shared \
