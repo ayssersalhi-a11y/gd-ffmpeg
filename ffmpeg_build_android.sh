@@ -102,12 +102,17 @@ make clean distclean 2>/dev/null || true
     --extra-ldflags="-L${OPENSSL_BUILD}/lib" \
     --extra-libs="-lssl -lcrypto -lz"
 
-# [الحقنة الأقوى]: فرض -fPIC في ملفات الـ Makefile مباشرة
-echo "💉 حقن -fPIC في ملفات البناء (config.mak)..."
-sed -i 's/ASFLAGS=/ASFLAGS=-fPIC /g' config.mak
-sed -i 's/CFLAGS=/CFLAGS=-fPIC /g' config.mak
+# [الحقنة الأقوى]: فرض -fPIC في ملفات الـ Makefile مباشرة بعد التكوين
+if [ -f "config.mak" ]; then
+    echo "💉 حقن -fPIC في ملفات البناء (config.mak)..."
+    sed -i 's/ASFLAGS=/ASFLAGS=-fPIC /g' config.mak
+    sed -i 's/CFLAGS=/CFLAGS=-fPIC /g' config.mak
+else
+    echo "⚠️ خطأ: فشل توليد config.mak"
+    exit 1
+fi
 
 make -j"$(nproc)"
 make install
 
-echo "✅ تم بناء FFmpeg للأندرويد بنجاح كامل مع فرض PIC!"
+echo "✅ تم بناء FFmpeg للأندرويد بنجاح كامل!"
