@@ -23,20 +23,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FFMPEG_SRC_DIR="${SCRIPT_DIR}/ffmpeg_source"
 OUTPUT_DIR="${SCRIPT_DIR}/ffmpeg_build"
 OPENSSL_BUILD="${SCRIPT_DIR}/openssl_build"
-
-# ─── 2. بناء الأندرويد ──────────────────────────────────────────────────────
-NDK_PATH="${NDK_PATH:-${HOME}/android-ndk-r26c}"
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
+
+# ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
+if [ "$TARGET_PLATFORM" = "linux" ]; then
+    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64..."
+    unset CC CXX AS
+    mkdir -p "${OUTPUT_DIR}" "${FFMPEG_SRC_DIR}"
+    
+    if [ ! -f "${FFMPEG_SRC_DIR}/configure" ]; then
+        wget -q --show-progress "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -O "${SCRIPT_DIR}/ffmpeg.tar.gz"
+        tar xzf "${SCRIPT_DIR}/ffmpeg.tar.gz" -C "${FFMPEG_SRC_DIR}" --strip-components=1
+    fi
+    
+    cd "${FFMPEG_SRC_DIR}"
+    make clean distclean 2>/dev/null || true
+    ./configure --prefix="${OUTPUT_DIR}" --enable-static --disable-shared --disable-programs --disable-doc --enable-openssl --extra-cflags="-I${OPENSSL_BUILD}/include" --extra-ldflags="-L${OPENSSL_BUILD}/lib"
+    make -j"$(nproc)" && make install
+    echo "✅ تم بناء FFmpeg للينكس بنجاح!"
+    exit 0
+fi
+
+# ─── 3. بناء Android ─────────────────────────────────────────────────────────
+NDK_PATH="${NDK_PATH:-${HOME}/android-ndk-r26c}"
 API_LEVEL="${API_LEVEL:-24}"
 
-# دالة البناء
 build_abi() {
-    local ABI="$1"
-    local ARCH="$2"
-    local CPU="$3"
-    local CROSS_PREFIX_BIN="$4"
+    local ABI="$1" ARCH="$2" CPU="$3" CROSS_PREFIX_BIN="$4"
     local PREFIX="${OUTPUT_DIR}/${ABI}"
-    
     mkdir -p "${PREFIX}"
     local TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
     
@@ -67,8 +81,7 @@ build_abi() {
     make install
 }
 
-# تحميل المصدر أولاً إذا لم يوجد
-if [ ! -d "${FFMPEG_SRC_DIR}" ]; then
+if [ ! -d "${FFMPEG_SRC_DIR}/configure" ]; then
     mkdir -p "${FFMPEG_SRC_DIR}"
     wget -q --show-progress "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -O ffmpeg.tar.gz
     tar xzf ffmpeg.tar.gz -C "${FFMPEG_SRC_DIR}" --strip-components=1
