@@ -1,0 +1,200 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  GitHub Actions — بناء libgdffmpeg.so (OpenSSL + FFmpeg)                 ║
+# ║  v4.1 — إصلاح -fPIC لبناء Linux                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+name: Build libgdffmpeg.so (OpenSSL + FFmpeg)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            arch: arm64
+          - platform: linux
+            arch: x86_64
+
+    env:
+      NDK_VERSION:        r26c
+      GODOT_CPP_BRANCH:   godot-4.3-stable
+      FFMPEG_VERSION:     "7.0"
+      OPENSSL_VERSION:    "3.0.13"
+      ANDROID_API:        "24"
+
+    steps:
+      # ── 1. استنساخ الريبو ─────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Android NDK ───────────────────────────────────────────────────────
+      - name: Setup Android NDK ${{ env.NDK_VERSION }}
+        if: matrix.platform == 'android'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      # ── 3. أدوات البناء ──────────────────────────────────────────────────────
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build nasm yasm python3 git \
+            pkg-config perl wget \
+            libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxi-dev libgl1-mesa-dev libglu1-mesa-dev alsa-utils libasound2-dev
+
+      # ── 4. كاش godot-cpp ────────────────────────────────────────────────────
+      - name: Cache godot-cpp
+        uses: actions/cache@v4
+        id: cache-godotcpp
+        with:
+          path: godot-cpp
+          key: godot-cpp-${{ env.GODOT_CPP_BRANCH }}-v1
+
+      - name: Clone godot-cpp
+        if: steps.cache-godotcpp.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive \
+            https://github.com/godotengine/godot-cpp.git \
+            --branch ${{ env.GODOT_CPP_BRANCH }} \
+            --depth 1 \
+            godot-cpp
+
+      # ── 5. كاش OpenSSL ──────────────────────────────────────────────────────
+      - name: Cache OpenSSL
+        uses: actions/cache@v4
+        id: cache-openssl
+        with:
+          path: openssl_build
+          # [v3] رُفع الرقم لإبطال الكاش القديم بعد إصلاح سكريبت البناء
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ matrix.platform }}-${{ matrix.arch }}-v3
+
+      # ── 6. بناء OpenSSL (إذا لم يوجد في الكاش) ──────────────────────────────
+      - name: Build OpenSSL for ${{ matrix.platform }} (${{ matrix.arch }})
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+          OPENSSL_VERSION: ${{ env.OPENSSL_VERSION }}
+          API_LEVEL: ${{ env.ANDROID_API }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+        run: |
+          chmod +x build_openssl_android.sh
+          ./build_openssl_android.sh
+
+      - name: Verify OpenSSL output
+        run: |
+          echo "── ملفات OpenSSL ──"
+          ls -lh openssl_build/lib/ || true
+          ls openssl_build/include/openssl/ | head -10 || true
+
+      # ── 7. كاش FFmpeg ────────────────────────────────────────────────────────
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        id: cache-ffmpeg
+        with:
+          path: ffmpeg_build
+          # [v4] رُفع الرقم — FFmpeg يُعاد بناؤه مع --enable-pic لإصلاح Assembly PIC
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ matrix.platform }}-${{ matrix.arch }}-v4
+
+      # ── 8. بناء FFmpeg (إذا لم يوجد في الكاش) ────────────────────────────────
+      - name: Build FFmpeg + OpenSSL for ${{ matrix.platform }} (${{ matrix.arch }})
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+          FFMPEG_VERSION: ${{ env.FFMPEG_VERSION }}
+          API_LEVEL: ${{ env.ANDROID_API }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+        run: |
+          chmod +x ffmpeg_build_android.sh
+          ./ffmpeg_build_android.sh
+
+      - name: Verify FFmpeg output
+        run: |
+          echo "── مكتبات FFmpeg ──"
+          ls -lh ffmpeg_build/${{ matrix.arch }}/lib/ || ls -lh ffmpeg_build/ || true
+
+      # ── 9. التحقق من OpenSSL قبل البناء ──────────────────────────────────────
+      - name: Debug - Check if OpenSSL files exist
+        run: |
+          echo "Looking for OpenSSL libraries..."
+
+          if [ -d "${{ github.workspace }}/openssl_build/lib64" ] && [ ! -f "${{ github.workspace }}/openssl_build/lib/libssl.a" ]; then
+            echo "[INFO] Detected lib64 folder, copying contents to lib for compatibility..."
+            mkdir -p "${{ github.workspace }}/openssl_build/lib"
+            cp -r ${{ github.workspace }}/openssl_build/lib64/* ${{ github.workspace }}/openssl_build/lib/
+          fi
+
+          if [ -f "${{ github.workspace }}/openssl_build/lib/libssl.a" ]; then
+            echo "✅ Success: libssl.a found!"
+          else
+            echo "::error:: File libssl.a is genuinely missing!"
+            exit 1
+          fi
+
+      # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
+      - name: Build libgdffmpeg.so
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          if [ "${{ matrix.platform }}" = "android" ]; then
+            cmake -S . -B _cmake_build/${{ matrix.arch }} \
+              -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a \
+              -DANDROID_PLATFORM=android-${{ env.ANDROID_API }} \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
+              -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
+              -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
+          else
+            cmake -S . -B _cmake_build/${{ matrix.arch }} \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
+              -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
+              -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
+          fi
+          cmake --build _cmake_build/${{ matrix.arch }} --parallel $(nproc)
+
+      # ── 11. جمع الملفات الناتجة ──────────────────────────────────────────────
+      - name: Collect output files
+        run: |
+          mkdir -p dist/addons/gdffmpeg/bin
+
+          find _cmake_build -name "*.so" -exec cp {} dist/addons/gdffmpeg/bin/ \;
+
+          cp gdffmpeg.gdextension dist/addons/gdffmpeg/ 2>/dev/null || true
+
+          echo "══ الملفات التي تم جمعها ══"
+          ls -R dist/
+
+      # ── 12. رفع الملفات ───────────────────────────────────────────────────────
+      - name: Upload compiled .so files
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgdffmpeg-${{ matrix.platform }}-${{ github.ref_name }}-${{ github.run_number }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── 13. ملخص ─────────────────────────────────────────────────────────────
+      - name: Build summary
+        run: |
+          echo "## ✅ البناء مكتمل لمنصة (${{ matrix.platform }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| الملف | الحجم |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          for f in dist/addons/gdffmpeg/bin/*; do
+            [ -f "$f" ] && echo "| \`$(basename $f)\` | $(du -h $f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          done
