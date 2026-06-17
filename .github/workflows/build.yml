@@ -36,6 +36,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── [إضافة جديدة] التنظيف قبل البدء ─────────────────────────────────────
+      - name: Clean build environment
+        run: |
+          echo "Cleaning up old build artifacts..."
+          rm -rf ffmpeg_source/
+          rm -rf ffmpeg_build/
+          rm -rf _cmake_build/
+          
       # ── 2. Android NDK ───────────────────────────────────────────────────────
       - name: Setup Android NDK ${{ env.NDK_VERSION }}
         if: matrix.platform == 'android'
