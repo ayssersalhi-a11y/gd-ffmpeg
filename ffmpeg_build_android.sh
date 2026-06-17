@@ -63,9 +63,8 @@ PREFIX="${OUTPUT_DIR}/${ABI}"
 
 export CC="${TOOLCHAIN}/bin/${CROSS_PREFIX}${API_LEVEL}-clang"
 export CXX="${TOOLCHAIN}/bin/${CROSS_PREFIX}${API_LEVEL}-clang++"
-export AS="${TOOLCHAIN}/bin/clang"
 
-# [الحل الجذري]: فرض -fPIC في كافة المتغيرات
+# [الحل الجذري]: تصدير الـ Flags كمتغيرات بيئية ليلتقطها السكربت تلقائياً
 export ASFLAGS="-fPIC"
 export CFLAGS="-fPIC -Os -I${OPENSSL_BUILD}/include"
 export CXXFLAGS="-fPIC"
@@ -73,6 +72,7 @@ export CXXFLAGS="-fPIC"
 cd "${FFMPEG_SRC_DIR}"
 make clean distclean 2>/dev/null || true
 
+# تشغيل configure بدون الخيار المرفوض
 ./configure \
     --prefix="${PREFIX}" \
     --target-os=android \
@@ -82,7 +82,6 @@ make clean distclean 2>/dev/null || true
     --sysroot="${TOOLCHAIN}/sysroot" \
     --cc="${CC}" \
     --cxx="${CXX}" \
-    --as="${AS}" \
     --enable-static \
     --disable-shared \
     --disable-programs \
@@ -98,11 +97,10 @@ make clean distclean 2>/dev/null || true
     --enable-openssl \
     --extra-cflags="${CFLAGS}" \
     --extra-cxxflags="${CXXFLAGS}" \
-    --extra-asflags="${ASFLAGS}" \
     --extra-ldflags="-L${OPENSSL_BUILD}/lib" \
     --extra-libs="-lssl -lcrypto -lz"
 
 make -j"$(nproc)"
 make install
 
-echo "✅ تم بناء FFmpeg للأندرويد مع دعم كامل لـ PIC!"
+echo "✅ تم بناء FFmpeg للأندرويد بنجاح!"
