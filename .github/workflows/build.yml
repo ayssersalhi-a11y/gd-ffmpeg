@@ -179,16 +179,20 @@ jobs:
           fi
           cmake --build _cmake_build/${{ matrix.arch }} --parallel $(nproc)
 
-      # ── 11. جمع الملفات الناتجة ──────────────────────────────────────────────
+      # ── 11. جمع الملفات في مجلد واحد (Deployment Ready) ─────────────────────
       - name: Collect output files
         run: |
-          mkdir -p dist/addons/gdffmpeg/bin
+          # إنشاء مجلد توزيع موحد
+          mkdir -p dist/bin
+          
+          # نسخ ملفات المكتبة المشتركة (.so) من مسارات البناء المختلفة إلى المجلد الموحد
+          # هذا الأمر سيبحث في _cmake_build عن أي ملف .so وينسخه لـ dist/bin
+          find _cmake_build -name "*.so" -exec cp {} dist/bin/ \;
+          
+          # نسخ ملف الـ gdextension إلى المجلد الرئيسي للتوزيع
+          cp gdffmpeg.gdextension dist/
 
-          find _cmake_build -name "*.so" -exec cp {} dist/addons/gdffmpeg/bin/ \;
-
-          cp gdffmpeg.gdextension dist/addons/gdffmpeg/ 2>/dev/null || true
-
-          echo "══ الملفات التي تم جمعها ══"
+          echo "══ محتويات مجلد التوزيع النهائي (dist) ══"
           ls -R dist/
 
       # ── 12. رفع الملفات ───────────────────────────────────────────────────────
