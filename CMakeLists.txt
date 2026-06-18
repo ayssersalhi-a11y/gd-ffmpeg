@@ -73,6 +73,26 @@ target_link_libraries(gdffmpeg PRIVATE
 )
 
 
+# ─── ربط مكتبات النظام (ضروري جداً لتجنب أخطاء undefined symbol) ─────────────
+if(IS_ANDROID)
+    # للأندرويد: مكتبة z (zlib) مطلوبة بشدة، بالإضافة لمكتبات النظام الأساسية
+    target_link_libraries(gdffmpeg PRIVATE
+        z
+        android
+        log
+        m
+        jnigraphics
+        mediandk
+    )
+else()
+    # للينكس: pthread و dl و m و z ضرورية لكل من FFmpeg و OpenSSL
+    target_link_libraries(gdffmpeg PRIVATE
+        pthread
+        dl
+        m
+        z
+    )
+endif()
 
 # ─── خيارات التجميع ──────────────────────────────────────────────────────────
 target_compile_options(gdffmpeg PRIVATE
