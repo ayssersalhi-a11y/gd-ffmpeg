@@ -6,16 +6,11 @@ set -e
 # 
 # المشكلة: خطأ "relocation R_AARCH64... cannot be used against symbol"
 # السبب: تعارض بين تعليمات الـ Assembly (NEON) الخاصة بـ FFmpeg 7.0 وبين 
-#        قواعد الـ Relocation الصارمة في Android NDK r26c (أو أحدث).
+#        قواعد الـ Relocation الصارمة في Android NDK r26c.
 # 
-# الحل المتبع: استخدمنا "--disable-asm".
+# الحل المتبع: استخدمنا "--disable-asm" في بناء الأندرويد.
 # 
-# ما الذي يجب فعله للرجوع "للاستعمال الكامل" (استعادة الأداء):
-# 1. إذا أردت استعادة سرعة الـ Assembly (NEON)، لا تحذف "--disable-asm" فحسب،
-#    بل يجب التراجع إلى إصدار NDK أقدم (مثل r25b) حيث كانت قواعد الربط 
-#    أقل صرامة، أو تحديث FFmpeg لإصدار أحدث إذا صدر إصدار يحل هذا التعارض.
-# 2. إذا قمت بحذف "--disable-asm" مع بقاء NDK r26c، سيعود الخطأ للظهور،
-#    وهذا يعني أنك بحاجة لإعادة ضبط أعلام الـ Linker أو تحديث بيئة البناء.
+# للتوافق مع Linux/Godot: استخدمنا "--enable-pic" و "-fPIC" في الـ extra-cflags.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
@@ -27,7 +22,7 @@ FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 
 # ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
 if [ "$TARGET_PLATFORM" = "linux" ]; then
-    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64..."
+    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع دعم fPIC..."
     unset CC CXX AS
     mkdir -p "${OUTPUT_DIR}" "${FFMPEG_SRC_DIR}"
     
@@ -38,7 +33,16 @@ if [ "$TARGET_PLATFORM" = "linux" ]; then
     
     cd "${FFMPEG_SRC_DIR}"
     make clean distclean 2>/dev/null || true
-    ./configure --prefix="${OUTPUT_DIR}" --enable-static --disable-shared --disable-programs --disable-doc --enable-openssl --extra-cflags="-I${OPENSSL_BUILD}/include" --extra-ldflags="-L${OPENSSL_BUILD}/lib"
+    
+    ./configure \
+        --prefix="${OUTPUT_DIR}" \
+        --enable-static --disable-shared \
+        --disable-programs --disable-doc \
+        --enable-pic \
+        --enable-openssl \
+        --extra-cflags="-fPIC -I${OPENSSL_BUILD}/include" \
+        --extra-ldflags="-L${OPENSSL_BUILD}/lib"
+        
     make -j"$(nproc)" && make install
     echo "✅ تم بناء FFmpeg للينكس بنجاح!"
     exit 0
