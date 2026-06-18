@@ -60,7 +60,11 @@ API_LEVEL="${API_LEVEL:-24}"
 build_abi() {
     local ABI="$1" ARCH="$2" CPU="$3" CROSS_PREFIX_BIN="$4"
     local PREFIX="${OUTPUT_DIR}/${ABI}"
+    
+    # تنظيف خاص بـ ABI الحالي لضمان بناء نظيف
+    rm -rf "${PREFIX}"
     mkdir -p "${PREFIX}"
+    
     local TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
     
     export CC="${TOOLCHAIN}/bin/${CROSS_PREFIX_BIN}${API_LEVEL}-clang"
