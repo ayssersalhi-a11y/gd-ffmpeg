@@ -4,14 +4,12 @@ set -e
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚠️ ملاحظة للمستقبل (README for Future Reference):
 # 
-# المشكلة: خطأ "relocation R_AARCH64... cannot be used against symbol"
-# السبب: تعارض بين تعليمات الـ Assembly (NEON) الخاصة بـ FFmpeg 7.0 وبين 
-#        قواعد الـ Relocation الصارمة في Android NDK r26c.
+# المشكلة: خطأ "relocation ... cannot be used against symbol"
+# السبب: تعارض بين تعليمات الـ Assembly والـ Linker الصارم عند بناء مكتبات مشتركة.
 # 
-# الحل المتبع: استخدمنا "--disable-asm" في بناء الأندرويد.
-# 
-# للتوافق مع Linux/Godot: استخدمنا "--enable-pic" و "-fPIC" في الـ extra-cflags
-# مع مسح المكتبات القديمة لضمان عدم وجود ملفات بدون fPIC.
+# الحل المتبع: استخدمنا "--disable-asm" في كل من Linux و Android.
+# هذا يضمن استبدال تعليمات الـ Assembly بكود C متوافق تماماً مع -fPIC،
+# مما ينهي مشاكل الـ Linking نهائياً.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
@@ -23,9 +21,9 @@ FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 
 # ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
 if [ "$TARGET_PLATFORM" = "linux" ]; then
-    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع ضمان fPIC..."
+    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع ضمان fPIC (تعطيل ASM)..."
     
-    # مسح المكتبات القديمة التي قد تفتقر إلى fPIC
+    # مسح المكتبات القديمة لضمان بيئة بناء نظيفة
     rm -rf "${OUTPUT_DIR}/lib" "${OUTPUT_DIR}/include"
     
     unset CC CXX AS
@@ -39,10 +37,12 @@ if [ "$TARGET_PLATFORM" = "linux" ]; then
     cd "${FFMPEG_SRC_DIR}"
     make clean distclean 2>/dev/null || true
     
+    # تمت إضافة --disable-asm للينكس لضمان نجاح الـ Linking
     ./configure \
         --prefix="${OUTPUT_DIR}" \
         --enable-static --disable-shared \
         --disable-programs --disable-doc \
+        --disable-asm \
         --enable-pic \
         --enable-openssl \
         --extra-cflags="-fPIC -I${OPENSSL_BUILD}/include" \
@@ -61,7 +61,7 @@ build_abi() {
     local ABI="$1" ARCH="$2" CPU="$3" CROSS_PREFIX_BIN="$4"
     local PREFIX="${OUTPUT_DIR}/${ABI}"
     
-    # تنظيف خاص بـ ABI الحالي لضمان بناء نظيف
+    # تنظيف خاص بـ ABI الحالي
     rm -rf "${PREFIX}"
     mkdir -p "${PREFIX}"
     
