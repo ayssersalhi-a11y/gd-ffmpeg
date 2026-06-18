@@ -342,7 +342,7 @@ bool FFmpegPlayer::_setup_audio_codec(AVStream *as,
     return true;
 }
 
-// ─── [12] فتح رابط الصوت عبر FFmpeg (مُصلَح) ────────────────────────────────
+// ─── [12] فتح رابط الصوت عبر FFmpeg (مُصلَح) ───────────────────────────────
 bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     _cleanup_ext_audio();
 
@@ -375,13 +375,13 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (ret < 0) {
         av_dict_free(&opts);
         
-        // --- هنا "الزرعة" الأساسية لمعرفة السبب ---
+        // --- تحويل كود الخطأ إلى نص مفهوم ---
         char err_buf[256];
-        av_strerror(ret, err_buf, sizeof(err_buf)); // يحول الكود لنص
+        av_strerror(ret, err_buf, sizeof(err_buf)); 
         String error_msg = "[FFmpeg Critical] " + String(err_buf) + " (Error Code: " + String::num(ret) + ")";
         
-        UtilityFunctions::printerr(error_msg); // يطبع في الكونسول باللون الأحمر
-        _emit_playback_error(error_msg);       // يرسل الإشارة لجودو
+        UtilityFunctions::printerr(error_msg); 
+        _emit_playback_error(error_msg);       
         emit_signal("audio_loaded", false); 
         return false;
     }
@@ -391,21 +391,24 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (avformat_find_stream_info(ext_fmt_ctx, nullptr) < 0) {
         avformat_close_input(&ext_fmt_ctx);
         _emit_playback_error("[DEBUG-AUDIO] Failed to find stream info after opening.");
-        emit_signal("audio_loaded", false); return false;
+        emit_signal("audio_loaded", false); 
+        return false;
     }
 
     ext_audio_stream = av_find_best_stream(ext_fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (ext_audio_stream < 0) {
         avformat_close_input(&ext_fmt_ctx);
         _emit_playback_error("[DEBUG-AUDIO] No audio stream found in this URL.");
-        emit_signal("audio_loaded", false); return false;
+        emit_signal("audio_loaded", false); 
+        return false;
     }
 
     int rate = 0, ch = 0;
     if (!_setup_audio_codec(ext_fmt_ctx->streams[ext_audio_stream], ext_audio_ctx, ext_swr_ctx, rate, ch)) {
         avformat_close_input(&ext_fmt_ctx);
         _emit_playback_error("[DEBUG-AUDIO] Codec setup failed for external audio.");
-        emit_signal("audio_loaded", false); return false;
+        emit_signal("audio_loaded", false); 
+        return false;
     }
 
     // تهيئة مشغل جودو
