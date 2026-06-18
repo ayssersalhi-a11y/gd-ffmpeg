@@ -206,11 +206,15 @@ jobs:
 
       # ── 13. ملخص ─────────────────────────────────────────────────────────────
       - name: Build summary
+        if: always()
         run: |
-          echo "## ✅ البناء مكتمل لمنصة (${{ matrix.platform }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| الملف | الحجم |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          for f in dist/addons/gdffmpeg/bin/*; do
-            [ -f "$f" ] && echo "| \`$(basename $f)\` | $(du -h $f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-          done
+          {
+            echo "## ✅ البناء مكتمل لمنصة (${{ matrix.platform }})"
+            echo ""
+            echo "| الملف | الحجم |"
+            echo "|-------|-------|"
+            # التصحيح هنا: البحث في المسار الصحيح الذي وضعنا فيه الملفات (dist/bin)
+            for f in dist/bin/*; do
+              [ -f "$f" ] && echo "| \`$(basename $f)\` | $(du -h $f | cut -f1) |"
+            done
+          } >> $GITHUB_STEP_SUMMARY
