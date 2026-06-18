@@ -4,12 +4,11 @@ set -e
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚠️ ملاحظة للمستقبل (README for Future Reference):
 # 
-# المشكلة: خطأ "relocation ... cannot be used against symbol"
-# السبب: تعارض بين تعليمات الـ Assembly والـ Linker الصارم عند بناء مكتبات مشتركة.
+# المشكلة: خطأ "undefined symbol: inflateInit2_"
+# السبب: عدم ربط مكتبة zlib أثناء عملية الـ Linking النهائية.
 # 
-# الحل المتبع: استخدمنا "--disable-asm" في كل من Linux و Android.
-# هذا يضمن استبدال تعليمات الـ Assembly بكود C متوافق تماماً مع -fPIC،
-# مما ينهي مشاكل الـ Linking نهائياً.
+# الحل المتبع: إضافة "--enable-zlib" وتضمين "-lz" في الروابط لضمان توفر
+# خدمات ضغط البيانات التي يحتاجها libavformat.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
@@ -21,11 +20,9 @@ FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 
 # ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
 if [ "$TARGET_PLATFORM" = "linux" ]; then
-    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع ضمان fPIC (تعطيل ASM)..."
+    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع zlib و fPIC..."
     
-    # مسح المكتبات القديمة لضمان بيئة بناء نظيفة
     rm -rf "${OUTPUT_DIR}/lib" "${OUTPUT_DIR}/include"
-    
     unset CC CXX AS
     mkdir -p "${OUTPUT_DIR}" "${FFMPEG_SRC_DIR}"
     
@@ -37,19 +34,20 @@ if [ "$TARGET_PLATFORM" = "linux" ]; then
     cd "${FFMPEG_SRC_DIR}"
     make clean distclean 2>/dev/null || true
     
-    # تمت إضافة --disable-asm للينكس لضمان نجاح الـ Linking
     ./configure \
         --prefix="${OUTPUT_DIR}" \
         --enable-static --disable-shared \
         --disable-programs --disable-doc \
         --disable-asm \
         --enable-pic \
+        --enable-zlib \
         --enable-openssl \
         --extra-cflags="-fPIC -I${OPENSSL_BUILD}/include" \
-        --extra-ldflags="-L${OPENSSL_BUILD}/lib"
+        --extra-ldflags="-L${OPENSSL_BUILD}/lib" \
+        --extra-libs="-lz"
         
     make -j"$(nproc)" && make install
-    echo "✅ تم بناء FFmpeg للينكس بنجاح!"
+    echo "✅ تم بناء FFmpeg للينكس (مع zlib) بنجاح!"
     exit 0
 fi
 
@@ -61,12 +59,10 @@ build_abi() {
     local ABI="$1" ARCH="$2" CPU="$3" CROSS_PREFIX_BIN="$4"
     local PREFIX="${OUTPUT_DIR}/${ABI}"
     
-    # تنظيف خاص بـ ABI الحالي
     rm -rf "${PREFIX}"
     mkdir -p "${PREFIX}"
     
     local TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
-    
     export CC="${TOOLCHAIN}/bin/${CROSS_PREFIX_BIN}${API_LEVEL}-clang"
     export CXX="${TOOLCHAIN}/bin/${CROSS_PREFIX_BIN}${API_LEVEL}-clang++"
     
@@ -81,6 +77,7 @@ build_abi() {
         --disable-programs --disable-doc --disable-everything \
         --enable-avcodec --enable-avformat --enable-avutil --enable-swscale --enable-swresample \
         --enable-jni --enable-mediacodec \
+        --enable-zlib \
         --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg4,aac,mp3,opus,flac,ac3 \
         --enable-demuxer=mp4,matroska,mov,avi,hls,concat,mp3,ogg,aac,flac,wav,mpegts \
         --enable-parser=h264,hevc,aac,opus,mp3,flac \
@@ -90,8 +87,7 @@ build_abi() {
         --extra-ldflags="-L${OPENSSL_BUILD}/lib" \
         --extra-libs="-lssl -lcrypto -lz"
 
-    make -j"$(nproc)"
-    make install
+    make -j"$(nproc)" && make install
 }
 
 if [ ! -d "${FFMPEG_SRC_DIR}/configure" ]; then
