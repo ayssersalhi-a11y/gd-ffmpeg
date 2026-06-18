@@ -10,7 +10,8 @@ set -e
 # 
 # الحل المتبع: استخدمنا "--disable-asm" في بناء الأندرويد.
 # 
-# للتوافق مع Linux/Godot: استخدمنا "--enable-pic" و "-fPIC" في الـ extra-cflags.
+# للتوافق مع Linux/Godot: استخدمنا "--enable-pic" و "-fPIC" في الـ extra-cflags
+# مع مسح المكتبات القديمة لضمان عدم وجود ملفات بدون fPIC.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
@@ -22,7 +23,11 @@ FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 
 # ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
 if [ "$TARGET_PLATFORM" = "linux" ]; then
-    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع دعم fPIC..."
+    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع ضمان fPIC..."
+    
+    # مسح المكتبات القديمة التي قد تفتقر إلى fPIC
+    rm -rf "${OUTPUT_DIR}/lib" "${OUTPUT_DIR}/include"
+    
     unset CC CXX AS
     mkdir -p "${OUTPUT_DIR}" "${FFMPEG_SRC_DIR}"
     
