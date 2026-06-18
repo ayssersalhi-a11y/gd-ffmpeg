@@ -151,10 +151,14 @@ jobs:
           fi
 
       # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
+            # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
       - name: Build libgdffmpeg.so
         env:
           NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          # [إضافة جديدة] مسح أي ذاكرة تخزين مؤقت قديمة لـ CMake
+          rm -rf _cmake_build/${{ matrix.arch }}/*
+          
           if [ "${{ matrix.platform }}" = "android" ]; then
             cmake -S . -B _cmake_build/${{ matrix.arch }} \
               -G Ninja \
