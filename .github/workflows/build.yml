@@ -25,7 +25,7 @@ jobs:
             arch: x86_64
 
     env:
-      NDK_VERSION:        r25b
+      NDK_VERSION:        r26c
       GODOT_CPP_BRANCH:   godot-4.3-stable
       FFMPEG_VERSION:     "7.0"
       OPENSSL_VERSION:    "3.0.13"
