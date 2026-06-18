@@ -46,25 +46,32 @@ target_include_directories(gdffmpeg PRIVATE
 )
 
 # ─── ربط المكتبات ────────────────────────────────────────────────────────────
+
+# 1. تعريف مكتبات FFmpeg كـ Imported Target (هذا يضمن التعامل معها كمكتبات نظام)
+set(FFMPEG_LIBS 
+    avformat avcodec swscale swresample avutil
+)
+
+foreach(lib ${FFMPEG_LIBS})
+    add_library(ffmpeg::${lib} STATIC IMPORTED)
+    set_target_properties(ffmpeg::${lib} PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_PATH}/lib${lib}.a"
+        INTERFACE_POSITION_INDEPENDENT_CODE ON
+    )
+endforeach()
+
+# 2. ربط المشروع
 target_link_libraries(gdffmpeg PRIVATE
     godot-cpp
-    "${FFMPEG_LIB_PATH}/libavformat.a"
-    "${FFMPEG_LIB_PATH}/libavcodec.a"
-    "${FFMPEG_LIB_PATH}/libswscale.a"
-    "${FFMPEG_LIB_PATH}/libswresample.a"
-    "${FFMPEG_LIB_PATH}/libavutil.a"
+    ffmpeg::avformat
+    ffmpeg::avcodec
+    ffmpeg::swscale
+    ffmpeg::swresample
+    ffmpeg::avutil
     "${OPENSSL_DIR}/lib/libssl.a"
     "${OPENSSL_DIR}/lib/libcrypto.a"
 )
 
-# ربط مكتبات النظام حسب نوع المنصة
-if(IS_ANDROID)
-    # المكتبات المطلوبة لدعم الوسائط والرسومات في أندرويد
-    target_link_libraries(gdffmpeg PRIVATE android log z m jnigraphics mediandk)
-else()
-    # [FIX-5] إضافة z (zlib) و pthread و dl لأن FFmpeg+OpenSSL يحتاجانها على Linux
-    target_link_libraries(gdffmpeg PRIVATE pthread dl m z)
-endif()
 
 
 # ─── خيارات التجميع ──────────────────────────────────────────────────────────
