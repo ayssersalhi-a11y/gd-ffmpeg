@@ -59,6 +59,9 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <thread>
+#include <atomic>
+
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -162,6 +165,9 @@ private:
     std::deque<DecodedFrame> decoded_frame_queue;
     std::deque<AVFrame*>     decoded_audio_queue;
     std::deque<AVFrame*>     ext_audio_frame_queue;
+    std::thread audio_loading_thread;
+    std::atomic<bool> audio_loading_thread_running{false};
+    std::atomic<bool> audio_load_finished_successfully{false}; // علم الأمان الجديد
 
     static const int MAX_DECODED_FRAMES = 8;
     static const int MAX_AUDIO_FRAMES   = 32;
