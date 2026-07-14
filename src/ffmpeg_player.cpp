@@ -874,8 +874,17 @@ void FFmpegPlayer::seek(double seconds) {
 }
 
 // ─── _process ─────────────────────────────────────────────────────────────────
+// ─── _process ─────────────────────────────────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
     if (!fmt_ctx || !playing) return;
+
+    // التحقق الآمن من نجاح تحميل الصوت الشبكي في الخيط الرئيسي
+    if (audio_load_finished_successfully) {
+        audio_load_finished_successfully = false; // تصفير العلم فوراً لمنع التكرار
+        if (playing && !buffering) {
+            _start_audio_at(position); // تشغيل آمن ومستقر تماماً!
+        }
+    }
 
     _update_buffer_stats();
 
@@ -973,6 +982,7 @@ void FFmpegPlayer::_process(double delta) {
         else { stop(); _emit_video_finished(); }
     }
 }
+
 
 // ─── _update_buffer_stats ──────────────────────────────────────────────────────
 void FFmpegPlayer::_update_buffer_stats() {
@@ -1226,7 +1236,16 @@ void FFmpegPlayer::_clear_queues() {
 }
 
 // ─── التنظيف الكامل ───────────────────────────────────────────────────────────
+// ─── التنظيف الكامل ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup() {
+    // 1. تأمين وإغلاق الخيط أولاً وقبل كل شيء لمنع تصادم الذاكرة (Race Conditions)
+    if (audio_loading_thread_running) {
+        audio_loading_thread_running = false; 
+        if (audio_loading_thread.joinable()) {
+            audio_loading_thread.join(); // انتظر إغلاق الخيط بسلام
+        }
+    }
+
     _clear_queues();
     _cleanup_ext_audio();
     _stop_audio();
