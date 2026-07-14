@@ -1,6 +1,6 @@
 /**
  * ffmpeg_player.cpp
- * GDExtension — FFmpeg Video Player (Unified) for Godot 4
+ * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
  * الإصدار 6.1 — إصلاح AVERROR_INVALIDDATA + تحسين تشخيص البناء
  *
