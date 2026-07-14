@@ -460,15 +460,24 @@ void FFmpegPlayer::_allocate_buffers() {
 }
 
 // ─── تحميل الصوت الخارجي ─────────────────────────────────────────────────────
-// ─── تحميل الصوت الخارجي بشكل آمن ─────────────────────────────────────────────
+
 bool FFmpegPlayer::load_audio(const String &path) {
     bool path_is_network = path.begins_with("http://") || path.begins_with("https://");
     if (!use_external_audio && !path_is_network) {
         UtilityFunctions::print("[AUDIO] load_audio() ignored: internal audio mode");
         return false;
     }
+    
+    // إيقاف المشغلات بأمان
     if (ext_audio_player && ext_audio_player->is_playing()) ext_audio_player->stop();
     if (int_audio_player && int_audio_player->is_playing()) int_audio_player->stop();
+
+    // تأمين الخيط: إذا كان هناك خيط يعمل حالياً، ننتظر نهايته لضمان سلامة الذاكرة
+    if (audio_loading_thread_running) {
+        if (audio_loading_thread.joinable()) {
+            audio_loading_thread.join(); 
+        }
+    }
 
     // مسح طوابير الصوت القديمة تماماً
     for (auto *f : decoded_audio_queue)    av_frame_free(&f);
@@ -477,25 +486,19 @@ bool FFmpegPlayer::load_audio(const String &path) {
     ext_using_godot_player = false;
     int_audio_playback.unref();
     _reset_audio_clock(position);
+    audio_load_finished_successfully = false; // إعادة تهيئة العلم
 
     if (path.is_empty()) {
         loaded_audio_path = ""; emit_signal("audio_loaded", false); return false;
     }
 
-    // [تعديل] الروابط الشبكية يتم فتحها داخل خيط خلفي مستقل لمنع الـ Lag تماماً وتجنب الـ ANR
+    // الروابط الشبكية
     if (path.begins_with("http://") || path.begins_with("https://")) {
         loaded_audio_path = path;
-        
-        // منع تشغيل أكثر من خيط تحميل في نفس الوقت لحماية الذاكرة
-        if (audio_loading_thread_running) {
-            UtilityFunctions::print("[AUDIO] Thread already running, skipping background launch.");
-            return false;
-        }
-
         audio_loading_thread_running = true;
-        std::thread background_thread(&FFmpegPlayer::_open_audio_async_worker, this, path);
-        background_thread.detach(); // فصل الخيط ليعمل في الخلفية بحرية
         
+        // إطلاق الخيط والاحتفاظ به في الكلاس (بدون استخدام detach!)
+        audio_loading_thread = std::thread(&FFmpegPlayer::_open_audio_async_worker, this, path);
         return true; 
     }
 
@@ -546,18 +549,21 @@ bool FFmpegPlayer::load_audio(const String &path) {
     return true;
 }
 
+
 // ─── دالة العامل الخلفي لفتح الصوت الشبكي (جديدة ومساعدة) ──────────────────────────
 void FFmpegPlayer::_open_audio_async_worker(String path) {
-    // فتح الاتصال من الشبكة بأمان في الخلفية (دالة avformat_open_input تعمل هنا الآن)
     bool ok = _open_audio_with_ffmpeg(path);
     
-    if (ok && playing && !buffering) {
-        // العودة لبدء تشغيل الصوت بمجرد انتهاء الفتح الشبكي بنجاح
-        _start_audio_at(position);
+    if (ok) {
+        // نكتفي برفع العلم فقط، ولا نستدعي _start_audio_at من هنا!
+        audio_load_finished_successfully = true; 
+    } else {
+        audio_load_finished_successfully = false;
     }
     
-    audio_loading_thread_running = false; // تحرير علم تشغيل الخيط
+    audio_loading_thread_running = false; 
 }
+
 void FFmpegPlayer::unload_audio() {
     if (ext_audio_player && ext_audio_player->is_playing()) ext_audio_player->stop();
     if (int_audio_player && int_audio_player->is_playing()) int_audio_player->stop();
