@@ -59,9 +59,6 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
-#include <thread>
-#include <atomic>
-
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -165,9 +162,11 @@ private:
     std::deque<DecodedFrame> decoded_frame_queue;
     std::deque<AVFrame*>     decoded_audio_queue;
     std::deque<AVFrame*>     ext_audio_frame_queue;
+    
+    // خيوط المعالجة الخلفية والتحكم بالصوت الشبكي
     std::thread audio_loading_thread;
     std::atomic<bool> audio_loading_thread_running{false};
-    std::atomic<bool> audio_load_finished_successfully{false}; // علم الأمان الجديد
+    std::atomic<bool> audio_load_finished_successfully{false};
 
     static const int MAX_DECODED_FRAMES = 8;
     static const int MAX_AUDIO_FRAMES   = 32;
@@ -219,23 +218,20 @@ private:
     // ── [K] ثوابت الاستشعار الزمني الجديدة (v6) ─────────────────────────────
 
     // [7] Audio Auto-Recovery
-    double last_audio_pts       = -1.0; // آخر PTS صوتي صحيح مرّ
+    double last_audio_pts       = -1.0; 
     bool   audio_resync_needed  = false;
-    static constexpr double AUDIO_GAP_RESYNC_S = 0.5;  // فجوة تستدعي flush
-    static constexpr double AUDIO_GAP_SKIP_S   = 1.0;  // فجوة تستدعي seek
+    static constexpr double AUDIO_GAP_RESYNC_S = 0.5;  
+    static constexpr double AUDIO_GAP_SKIP_S   = 1.0;  
 
     // [11] Hard Frame Drop + GPU Latency
-    static constexpr double HARD_DROP_THRESHOLD = 0.020; // 20ms
-    static constexpr double GPU_LATENCY_OFFSET  = -0.050; // -50ms
+    static constexpr double HARD_DROP_THRESHOLD = 0.020; 
+    static constexpr double GPU_LATENCY_OFFSET  = -0.050; 
 
-    // ─── [إضافة] علم مراقبة خيط تحميل الصوت الشبكي في الخلفية ───
-    std::atomic<bool> audio_loading_thread_running{false};
     // ── الدوال الداخلية ──────────────────────────────────────────────────────
     bool _setup_video_codec(AVStream *vstream);
     bool _setup_audio_codec(AVStream *astream, AVCodecContext *&ctx_out,
                             SwrContext *&swr_out, int &rate_out, int &ch_out);
     bool _open_audio_with_ffmpeg(const String &path);
-    // ─── [إضافة] دالة خيط المعالجة الخلفي لفتح روابط الشبكة ───
     void _open_audio_async_worker(String path);
     void _cleanup_ext_audio();
 
@@ -249,11 +245,11 @@ private:
     void _decode_audio_into_queue();
     void _decode_ext_audio_into_queue();
 
-    // [8+9+10+11] ضخ الصوت مع كل ضمانات الجودة
+    // [8+9+10+11] ضخ الصوت
     void _push_audio_frames(std::deque<AVFrame*> &queue, SwrContext *swr, int src_rate);
-    void _fill_silence(int frames_count); // [9] صمت بديل
+    void _fill_silence(int frames_count); 
 
-    // [11] عرض الإطار مع Hard Drop
+    // [11] عرض الإطار
     bool _present_frame_at(double pos);
 
     // [7] التعافي التلقائي
@@ -268,7 +264,7 @@ private:
     void _reset_audio_clock(double pos);
 
     void _allocate_buffers();
-    void _clear_queues();   // [6] يمسح حزم الصوت أيضاً
+    void _clear_queues();   
     void _cleanup();
 
     void _emit_video_loaded(bool success);
