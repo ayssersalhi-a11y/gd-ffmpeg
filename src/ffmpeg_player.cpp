@@ -888,7 +888,7 @@ void FFmpegPlayer::_process(double delta) {
 
     _update_buffer_stats();
 
-    // مرحلة التعبئة
+    // مرحلة التعبئة (Buffering)
     if (buffering) {
         _read_packets_to_queue();
         _read_ext_audio_packets();
@@ -904,7 +904,7 @@ void FFmpegPlayer::_process(double delta) {
         return;
     }
 
-    // نضوب البافر
+    // نضوب البافر (Underrun)
     if (forward_buffer_secs < 0.2 && decoded_frame_queue.empty()) {
         buffering = true; _pause_audio();
         if (is_inside_tree()) emit_signal("buffering_changed", true);
@@ -948,7 +948,7 @@ void FFmpegPlayer::_process(double delta) {
 
     frame_timer += delta;
 
-    // قراءة وفك تشفير
+    // قراءة وفك تشفير الإطارات
     _read_packets_to_queue();
     _read_ext_audio_packets();
 
@@ -959,10 +959,10 @@ void FFmpegPlayer::_process(double delta) {
     if ((int)ext_audio_frame_queue.size() < MAX_AUDIO_FRAMES)
         _decode_ext_audio_into_queue();
 
-    // عرض الإطار
+    // عرض الإطار الحالي على الشاشة
     _present_frame_at(position);
 
-    // ضخ الصوت
+    // ضخ عينات الصوت إلى البافر
     if (!ext_using_godot_player) {
         if (audio_stream_idx >= 0 && swr_ctx)
             _push_audio_frames(decoded_audio_queue, swr_ctx, audio_sample_rate);
@@ -970,18 +970,41 @@ void FFmpegPlayer::_process(double delta) {
             _push_audio_frames(ext_audio_frame_queue, ext_swr_ctx, 0);
     }
 
-    // [4] إشارة الحالة كل 0.5ث
+    // [4] إشارة الحالة كل 0.5 ثانية
     status_timer += delta;
     if (status_timer >= STATUS_INTERVAL) {
         status_timer = 0.0; _emit_buffering_status();
     }
 
-    // نهاية الفيديو
+    // ─── التحقق الذكي والمشترك من نهاية الفيديو ──────────────────────────────
     if (duration > 0.0 && position >= duration) {
-        if (looping) seek(0.0);
-        else { stop(); _emit_video_finished(); }
+        bool audio_buffer_empty = true;
+        
+        // إذا كنا نستخدم صوت جودو الداخلي/الخارجي عبر الـ generator والمشغل يعمل
+        if (!ext_using_godot_player && int_audio_playback.is_valid() && int_audio_generator.is_valid()) {
+            // حساب الإطارات التي تم ضخها ولا تزال تنتظر دورها في التشغيل داخل بافر جودو
+            int remaining_frames = int_audio_playback->get_frames_available(); 
+            int total_buffer_size = (int)(godot_mix_rate * int_audio_generator->get_buffer_length());
+            int buffered_frames = total_buffer_size - remaining_frames;
+
+            // إذا كان هناك أكثر من 40ms من الصوت لم تشغل بعد، ننتظر ولا ننهي الفيديو الآن
+            if (buffered_frames > (int)(godot_mix_rate * 0.04)) {
+                audio_buffer_empty = false;
+            }
+        }
+
+        if (audio_buffer_empty) {
+            if (looping) {
+                seek(0.0);
+            } else {
+                stop();
+                _emit_video_finished();
+            }
+        }
     }
 }
+
+
 
 
 // ─── _update_buffer_stats ──────────────────────────────────────────────────────
