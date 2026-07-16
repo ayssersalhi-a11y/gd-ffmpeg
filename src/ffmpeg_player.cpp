@@ -227,7 +227,7 @@ bool FFmpegPlayer::load_video(const String &path) {
                 audio_sample_rate = rate; audio_channels = ch;
                 int_audio_generator.instantiate();
                 int_audio_generator->set_mix_rate((float)godot_mix_rate);
-                int_audio_generator->set_buffer_length(0.5);
+                int_audio_generator->set_buffer_length(0.15);
                 int_audio_player->set_stream(int_audio_generator);
             } else {
                 UtilityFunctions::printerr("[AUDIO] Internal setup failed, video-only.");
@@ -415,7 +415,7 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (int_audio_generator.is_null()) {
         int_audio_generator.instantiate();
         int_audio_generator->set_mix_rate((float)godot_mix_rate);
-        int_audio_generator->set_buffer_length(0.5);
+        int_audio_generator->set_buffer_length(0.15);
         int_audio_player->set_stream(int_audio_generator);
     }
 
