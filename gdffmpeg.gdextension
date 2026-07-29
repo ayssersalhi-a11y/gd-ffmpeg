@@ -11,9 +11,13 @@ android.debug.arm64   = "res://addons/gdffmpeg/bin/libgdffmpeg.android.arm64.so"
 ; android.release.arm32 = "res://addons/gdffmpeg/bin/libgdffmpeg.android.arm32.so"
 ; android.debug.arm32   = "res://addons/gdffmpeg/bin/libgdffmpeg.android.arm32.so"
 
-; [FIX-4] إضافة إدخالات Linux — بدونها لن يحمّل Godot الإضافة على Linux
+; Linux — x86_64 (أجهزة الكمبيوتر والخوادم العادية)
 linux.release.x86_64 = "res://addons/gdffmpeg/bin/libgdffmpeg.linux.x86_64.so"
 linux.debug.x86_64   = "res://addons/gdffmpeg/bin/libgdffmpeg.linux.x86_64.so"
+
+; Linux — ARM 64-bit (الإضافة الجديدة لدعم aarch64)
+linux.release.arm64 = "res://addons/gdffmpeg/bin/libgdffmpeg.linux.arm64.so"
+linux.debug.arm64   = "res://addons/gdffmpeg/bin/libgdffmpeg.linux.arm64.so"
 
 [dependencies]
 ; لا حاجة لمكتبات خارجية مشتركة — كل شيء مدمج statically
