@@ -121,37 +121,102 @@ log_ok "FFmpeg جاهز: ${FFMPEG_BUILD}"
 # ─── المرحلة 3: بناء libgdffmpeg.so ──────────────────────────────────────────
 log_step "المرحلة 3: بناء libgdffmpeg.so (Godot GDExtension)"
 
-TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake"
 BUILD_TEMP="${SCRIPT_DIR}/_cmake_build"
 DIST_DIR="${SCRIPT_DIR}/dist/addons/gdffmpeg/bin"
 mkdir -p "${DIST_DIR}"
 
-# arm64-v8a
-echo "  ── بناء arm64-v8a ──"
-cmake \
-    -S "${SCRIPT_DIR}" \
-    -B "${BUILD_TEMP}/arm64" \
-    -G Ninja \
-    -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
-    -DANDROID_ABI=arm64-v8a \
-    -DANDROID_PLATFORM=android-${API_LEVEL} \
-    -DANDROID_STL=c++_shared \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
-    -DFFMPEG_DIR="${FFMPEG_BUILD}" \
-    -DOPENSSL_DIR="${OPENSSL_BUILD}" \
-    -DCMAKE_VERBOSE_MAKEFILE=OFF
+if [ "${TARGET_PLATFORM}" = "linux" ] && [ "${TARGET_ARCH}" = "arm64" ]; then
+    # ── بناء Linux ARM64 (Cross-Compile) ──
+    echo "  ── بناء Linux ARM64 (aarch64) ──"
+    cmake \
+        -S "${SCRIPT_DIR}" \
+        -B "${BUILD_TEMP}/linux_arm64" \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+        -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
+        -DFFMPEG_DIR="${FFMPEG_BUILD}" \
+        -DOPENSSL_DIR="${OPENSSL_BUILD}" \
+        -DCMAKE_VERBOSE_MAKEFILE=OFF
 
-cmake --build "${BUILD_TEMP}/arm64" --parallel "$(nproc)"
+    cmake --build "${BUILD_TEMP}/linux_arm64" --parallel "$(nproc)"
 
-# نسخ الملفات الناتجة
-SO_ARM64="${BUILD_TEMP}/arm64/libgdffmpeg.android.arm64.so"
-if [ -f "${SO_ARM64}" ]; then
-    cp "${SO_ARM64}" "${DIST_DIR}/"
-    log_ok "arm64-v8a: $(du -h "${DIST_DIR}/libgdffmpeg.android.arm64.so" | cut -f1)"
+    SO_LINUX_ARM64="${BUILD_TEMP}/linux_arm64/libgdffmpeg.linux.arm64.so"
+    
+    # البحث عن ملف الـ SO (اسم الملف قد يختلف قليلاً حسب إعدادات Sconstruct في godot-cpp)
+    if [ ! -f "${SO_LINUX_ARM64}" ]; then
+       SO_LINUX_ARM64=$(find "${BUILD_TEMP}/linux_arm64" -name "*.so" | head -n 1)
+    fi
+
+    if [ -n "${SO_LINUX_ARM64}" ] && [ -f "${SO_LINUX_ARM64}" ]; then
+        cp "${SO_LINUX_ARM64}" "${DIST_DIR}/"
+        log_ok "linux-arm64: $(du -h "${SO_LINUX_ARM64}" | cut -f1)"
+    else
+        log_err "لم يُعثر على مكتبة .so المبنية لـ Linux ARM64"
+        exit 1
+    fi
+
+elif [ "${TARGET_PLATFORM}" = "linux" ] && [ "${TARGET_ARCH}" = "x86_64" ]; then
+    # ── بناء Linux x86_64 (Native) ──
+    echo "  ── بناء Linux x86_64 ──"
+    cmake \
+        -S "${SCRIPT_DIR}" \
+        -B "${BUILD_TEMP}/linux_x86_64" \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
+        -DFFMPEG_DIR="${FFMPEG_BUILD}" \
+        -DOPENSSL_DIR="${OPENSSL_BUILD}" \
+        -DCMAKE_VERBOSE_MAKEFILE=OFF
+
+    cmake --build "${BUILD_TEMP}/linux_x86_64" --parallel "$(nproc)"
+    
+    SO_LINUX_X86=$(find "${BUILD_TEMP}/linux_x86_64" -name "*.so" | head -n 1)
+    if [ -n "${SO_LINUX_X86}" ] && [ -f "${SO_LINUX_X86}" ]; then
+        cp "${SO_LINUX_X86}" "${DIST_DIR}/"
+        log_ok "linux-x86_64: $(du -h "${SO_LINUX_X86}" | cut -f1)"
+    else
+        log_err "لم يُعثر على مكتبة .so المبنية لـ Linux x86_64"
+        exit 1
+    fi
+
 else
-    log_err "لم يُعثر على: ${SO_ARM64}"
-    exit 1
+    # ── بناء Android (الافتراضي) ──
+    echo "  ── بناء Android arm64-v8a ──"
+    TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake"
+    
+    cmake \
+        -S "${SCRIPT_DIR}" \
+        -B "${BUILD_TEMP}/arm64" \
+        -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+        -DANDROID_ABI=arm64-v8a \
+        -DANDROID_PLATFORM=android-${API_LEVEL} \
+        -DANDROID_STL=c++_shared \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
+        -DFFMPEG_DIR="${FFMPEG_BUILD}" \
+        -DOPENSSL_DIR="${OPENSSL_BUILD}" \
+        -DCMAKE_VERBOSE_MAKEFILE=OFF
+
+    cmake --build "${BUILD_TEMP}/arm64" --parallel "$(nproc)"
+
+    SO_ARM64="${BUILD_TEMP}/arm64/libgdffmpeg.android.arm64.so"
+    # احتياط: في حال كان الاسم مختلفاً
+    if [ ! -f "${SO_ARM64}" ]; then
+        SO_ARM64=$(find "${BUILD_TEMP}/arm64" -name "*.so" | head -n 1)
+    fi
+
+    if [ -n "${SO_ARM64}" ] && [ -f "${SO_ARM64}" ]; then
+        cp "${SO_ARM64}" "${DIST_DIR}/"
+        log_ok "android-arm64-v8a: $(du -h "${SO_ARM64}" | cut -f1)"
+    else
+        log_err "لم يُعثر على: ${SO_ARM64}"
+        exit 1
+    fi
 fi
 
 # نسخ ملف .gdextension
@@ -159,29 +224,3 @@ if [ -f "${SCRIPT_DIR}/gdffmpeg.gdextension" ]; then
     cp "${SCRIPT_DIR}/gdffmpeg.gdextension" "${SCRIPT_DIR}/dist/addons/gdffmpeg/"
     log_ok "gdffmpeg.gdextension ← مُنسَخ"
 fi
-
-# ─── ملخص نهائي ───────────────────────────────────────────────────────────────
-ELAPSED=$((SECONDS - START_TIME))
-MINUTES=$((ELAPSED / 60))
-SECS=$((ELAPSED % 60))
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  ✓ البناء مكتمل بنجاح!                                  ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-printf "║  الوقت المستغرق: %02d:%02d دقيقة\n" $MINUTES $SECS
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  الملفات الجاهزة في: dist/addons/gdffmpeg/              ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "  الملفات الناتجة:"
-find "${SCRIPT_DIR}/dist" -type f | while read f; do
-    SIZE=$(du -h "$f" | cut -f1)
-    echo "    ${SIZE}  ${f#${SCRIPT_DIR}/}"
-done
-
-echo ""
-echo "  الخطوة التالية:"
-echo "  انسخ مجلد dist/addons/gdffmpeg/ إلى:"
-echo "  YOUR_GODOT_PROJECT/addons/gdffmpeg/"
