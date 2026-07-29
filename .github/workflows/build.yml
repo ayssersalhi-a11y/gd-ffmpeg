@@ -57,23 +57,29 @@ jobs:
           add-to-path: true
 
       
-       # ── 3. أدوات البناء ───────────────────────────────────────────────────────────────
+# ── 3. أدوات البناء ───────────────────────────────────────────────────────────────
       - name: Install build tools
         run: |
           # 1. إضافة المعمارية
           sudo dpkg --add-architecture arm64
-          
-          # 2. تحديد amd64 بذكاء لكل المستودعات الحالية في كافة الملفات لتجنب خطأ 404
-          sudo find /etc/apt/sources.list* -type f -exec sed -i -E 's/^deb (http|https)/deb [arch=amd64] \1/g' {} +
-          
-          # 3. إضافة سيرفرات ports الخاصة بمعمارية arm64
-          sudo bash -c 'cat <<EOF > /etc/apt/sources.list.d/arm64-ports.list
+
+          # 2. كتابة ملف sources.list جديد بالكامل بشكل صريح
+          #    (بدل تعديل الملفات الموجودة بـ sed، لأن تنسيقها قد يختلف
+          #     بين صور الـ runner ويسبب بقاء بعض الأسطر بدون تقييد arch)
+          sudo rm -f /etc/apt/sources.list.d/ubuntu.sources
+          sudo bash -c 'cat <<EOF > /etc/apt/sources.list
+          deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
+          deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
+
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-backports main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe multiverse
           EOF'
-          
-          # 4. التحديث والتثبيت
+
+          # 3. التحديث والتثبيت
           sudo apt-get update -qq
           sudo apt-get install -y \
             cmake ninja-build nasm yasm python3 git \
