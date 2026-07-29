@@ -23,6 +23,9 @@ jobs:
             arch: arm64
           - platform: linux
             arch: x86_64
+          - platform: linux
+            arch: arm64
+
 
     env:
       NDK_VERSION:        r26c
@@ -60,7 +63,8 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build nasm yasm python3 git \
             pkg-config perl wget \
-            libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxi-dev libgl1-mesa-dev libglu1-mesa-dev alsa-utils libasound2-dev
+            libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxi-dev libgl1-mesa-dev libglu1-mesa-dev alsa-utils libasound2-dev \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       # ── 4. كاش godot-cpp ────────────────────────────────────────────────────
       - name: Cache godot-cpp
@@ -150,7 +154,6 @@ jobs:
             exit 1
           fi
 
-      # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
             # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
       - name: Build libgdffmpeg.so
         env:
@@ -166,6 +169,17 @@ jobs:
               -DANDROID_ABI=arm64-v8a \
               -DANDROID_PLATFORM=android-${{ env.ANDROID_API }} \
               -DCMAKE_BUILD_TYPE=Release \
+              -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
+              -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
+              -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
+          elif [ "${{ matrix.platform }}" = "linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
+            cmake -S . -B _cmake_build/${{ matrix.arch }} \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+              -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
               -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
               -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
               -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
