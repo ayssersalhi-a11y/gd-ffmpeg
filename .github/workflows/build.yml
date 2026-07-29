@@ -229,14 +229,15 @@ jobs:
           echo "══ محتويات مجلد التوزيع النهائي (dist) ══"
           ls -R dist/
 
-      # ── 12. رفع الملفات ───────────────────────────────────────────────────────
+       # ── 12. رفع الملفات ───────────────────────────────────────────────────────
       - name: Upload compiled .so files
         uses: actions/upload-artifact@v4
         with:
-          name: libgdffmpeg-${{ matrix.platform }}-${{ github.ref_name }}-${{ github.run_number }}
+          name: libgdffmpeg-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.ref_name }}-${{ github.run_number }}
           path: dist/
           retention-days: 30
           if-no-files-found: error
+
 
       # ── 13. ملخص ─────────────────────────────────────────────────────────────
       - name: Build summary
@@ -252,3 +253,47 @@ jobs:
               [ -f "$f" ] && echo "| \`$(basename $f)\` | $(du -h $f | cut -f1) |"
             done
           } >> $GITHUB_STEP_SUMMARY
+  bundle:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      # ── 1. سحب المستودع للحصول على ملف الـ gdextension ───────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. تحميل جميع المخرجات من الـ Matrix بناءً على الـ artifacts ──
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      # ── 3. ترتيب الملفات وضغطها ──────────────────────────────────────────
+      - name: Organize and create ZIP
+        run: |
+          # إنشاء هيكل المجلدات المطلوب (مجلد dist يحتوي على bin وملف الـ gdextension)
+          mkdir -p dist/bin
+          
+          # استخراج جميع ملفات الـ .so من المجلدات الفرعية ووضعها داخل dist/bin
+          find all_artifacts -name "*.so" -exec cp {} dist/bin/ \;
+          
+          # نسخ ملف الـ gdextension بجانب مجلد bin
+          cp gdffmpeg.gdextension dist/
+          
+          # طباعة محتويات مجلد التوزيع للتأكد من الشكل النهائي
+          echo "══ محتويات المجلد النهائي قبل الضغط ══"
+          ls -R dist/
+          
+          # ضغط محتويات مجلد dist بالكامل داخل ملف ZIP واحد
+          cd dist
+          zip -r ../gdffmpeg-complete-plugin.zip *
+          cd ..
+          
+          echo "✅ تم إنشاء ملف الضغط بنجاح!"
+
+      # ── 4. رفع ملف الـ ZIP النهائي وجعله قابلاً للتحميل ──────────────────
+      - name: Upload Final ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdffmpeg-plugin-v${{ github.run_number }}
+          path: gdffmpeg-complete-plugin.zip
+          retention-days: 30
