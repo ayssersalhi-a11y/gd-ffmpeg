@@ -56,15 +56,18 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
 
+      
       # ── 3. أدوات البناء ──────────────────────────────────────────────────────
       - name: Install build tools
         run: |
+          sudo dpkg --add-architecture arm64
           sudo apt-get update -qq
           sudo apt-get install -y \
             cmake ninja-build nasm yasm python3 git \
             pkg-config perl wget \
             libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxi-dev libgl1-mesa-dev libglu1-mesa-dev alsa-utils libasound2-dev \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            zlib1g-dev:amd64 zlib1g-dev:arm64
 
       # ── 4. كاش godot-cpp ────────────────────────────────────────────────────
       - name: Cache godot-cpp
