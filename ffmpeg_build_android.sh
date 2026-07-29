@@ -20,36 +20,58 @@ FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 
 # ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
 if [ "$TARGET_PLATFORM" = "linux" ]; then
-    echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع zlib و fPIC..."
-    
-    rm -rf "${OUTPUT_DIR}/lib" "${OUTPUT_DIR}/include"
-    unset CC CXX AS
-    mkdir -p "${OUTPUT_DIR}" "${FFMPEG_SRC_DIR}"
-    
-    if [ ! -f "${FFMPEG_SRC_DIR}/configure" ]; then
-        wget -q --show-progress "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -O "${SCRIPT_DIR}/ffmpeg.tar.gz"
-        tar xzf "${SCRIPT_DIR}/ffmpeg.tar.gz" -C "${FFMPEG_SRC_DIR}" --strip-components=1
-    fi
-    
-    cd "${FFMPEG_SRC_DIR}"
-    make clean distclean 2>/dev/null || true
-    
-    ./configure \
-        --prefix="${OUTPUT_DIR}" \
-        --enable-static --disable-shared \
-        --disable-programs --disable-doc \
-        --disable-asm \
-        --enable-pic \
-        --enable-zlib \
-        --enable-openssl \
-        --extra-cflags="-fPIC -I${OPENSSL_BUILD}/include" \
-        --extra-ldflags="-L${OPENSSL_BUILD}/lib" \
-        --extra-libs="-lz"
-        
-    make -j"$(nproc)" && make install
-    echo "✅ تم بناء FFmpeg للينكس (مع zlib) بنجاح!"
-    exit 0
+	
+	rm -rf "${OUTPUT_DIR}/lib" "${OUTPUT_DIR}/include"
+	unset CC CXX AS
+	mkdir -p "${OUTPUT_DIR}" "${FFMPEG_SRC_DIR}"
+	
+	if [ ! -f "${FFMPEG_SRC_DIR}/configure" ]; then
+		wget -q --show-progress "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -O "${SCRIPT_DIR}/ffmpeg.tar.gz"
+		tar xzf "${SCRIPT_DIR}/ffmpeg.tar.gz" -C "${FFMPEG_SRC_DIR}" --strip-components=1
+	fi
+	
+	cd "${FFMPEG_SRC_DIR}"
+	make clean distclean 2>/dev/null || true
+	
+	if [ "$TARGET_ARCH" = "arm64" ]; then
+		echo "⚙️  جاري بناء FFmpeg لـ Linux ARM64 (aarch64) مع zlib و fPIC..."
+		
+		./configure \
+			--prefix="${OUTPUT_DIR}" \
+			--enable-static --disable-shared \
+			--disable-programs --disable-doc \
+			--disable-asm \
+			--enable-pic \
+			--enable-zlib \
+			--enable-openssl \
+			--arch=aarch64 \
+			--target-os=linux \
+			--enable-cross-compile \
+			--cross-prefix=aarch64-linux-gnu- \
+			--extra-cflags="-fPIC -I${OPENSSL_BUILD}/include" \
+			--extra-ldflags="-L${OPENSSL_BUILD}/lib" \
+			--extra-libs="-lz"
+	else
+		echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع zlib و fPIC..."
+		
+		./configure \
+			--prefix="${OUTPUT_DIR}" \
+			--enable-static --disable-shared \
+			--disable-programs --disable-doc \
+			--disable-asm \
+			--enable-pic \
+			--enable-zlib \
+			--enable-openssl \
+			--extra-cflags="-fPIC -I${OPENSSL_BUILD}/include" \
+			--extra-ldflags="-L${OPENSSL_BUILD}/lib" \
+			--extra-libs="-lz"
+	fi
+		
+	make -j"$(nproc)" && make install
+	echo "✅ تم بناء FFmpeg للينكس (مع zlib) بنجاح!"
+	exit 0
 fi
+
 
 # ─── 3. بناء Android ─────────────────────────────────────────────────────────
 NDK_PATH="${NDK_PATH:-${HOME}/android-ndk-r26c}"
