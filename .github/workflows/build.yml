@@ -100,6 +100,7 @@ jobs:
           OPENSSL_VERSION: ${{ env.OPENSSL_VERSION }}
           API_LEVEL: ${{ env.ANDROID_API }}
           TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           chmod +x build_openssl_android.sh
           ./build_openssl_android.sh
@@ -127,14 +128,11 @@ jobs:
           FFMPEG_VERSION: ${{ env.FFMPEG_VERSION }}
           API_LEVEL: ${{ env.ANDROID_API }}
           TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           chmod +x ffmpeg_build_android.sh
           ./ffmpeg_build_android.sh
 
-      - name: Verify FFmpeg output
-        run: |
-          echo "── مكتبات FFmpeg ──"
-          ls -lh ffmpeg_build/${{ matrix.arch }}/lib/ || ls -lh ffmpeg_build/ || true
 
       # ── 9. التحقق من OpenSSL قبل البناء ──────────────────────────────────────
       - name: Debug - Check if OpenSSL files exist
