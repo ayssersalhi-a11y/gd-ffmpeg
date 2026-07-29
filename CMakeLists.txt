@@ -109,7 +109,7 @@ target_link_options(gdffmpeg PRIVATE
     -Wl,--strip-all
 )
 
-# ─── اسم الملف الناتج (ذكي) ──────────────────────────────────────────────────
+# ─── اسم الملف الناتج (ذكي ومخصص حسب المنصة والمعمارية) ─────────────────────
 if(IS_ANDROID)
     set_target_properties(gdffmpeg PROPERTIES
         OUTPUT_NAME "gdffmpeg.android.arm64"
@@ -117,11 +117,19 @@ if(IS_ANDROID)
         SUFFIX      ".so"
     )
 else()
-    set_target_properties(gdffmpeg PROPERTIES
-        OUTPUT_NAME "gdffmpeg.linux.x86_64"
-        PREFIX      "lib"
-        SUFFIX      ".so"
-    )
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        set_target_properties(gdffmpeg PROPERTIES
+            OUTPUT_NAME "gdffmpeg.linux.arm64"
+            PREFIX      "lib"
+            SUFFIX      ".so"
+        )
+    else()
+        set_target_properties(gdffmpeg PROPERTIES
+            OUTPUT_NAME "gdffmpeg.linux.x86_64"
+            PREFIX      "lib"
+            SUFFIX      ".so"
+        )
+    endif()
 endif()
 
 # ─── رسالة ما بعد البناء ─────────────────────────────────────────────────────
