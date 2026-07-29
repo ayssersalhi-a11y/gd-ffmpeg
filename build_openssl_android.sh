@@ -41,25 +41,36 @@ make clean 2>/dev/null || true
 
 # ─── 4. بناء اللينكس (إذا كان الهدف linux) ──────────────────────────────────
 if [ "$TARGET_PLATFORM" = "linux" ]; then
-    echo ""
-    echo "══ تهيئة OpenSSL لـ Linux x86_64 ══"
+	echo ""
+	
+	if [ "$TARGET_ARCH" = "arm64" ]; then
+		echo "══ تهيئة OpenSSL لـ Linux ARM64 (aarch64) ══"
+		
+		# إعداد مترجم البناء المتقاطع
+		export CROSS_COMPILE=aarch64-linux-gnu-
+		
+		./Configure linux-aarch64 no-shared -fPIC \
+			--prefix="${OUTPUT_DIR}" \
+			--openssldir="${OUTPUT_DIR}/ssl"
+	else
+		echo "══ تهيئة OpenSSL لـ Linux x86_64 ══"
+		./Configure linux-x86_64 no-shared -fPIC \
+			--prefix="${OUTPUT_DIR}" \
+			--openssldir="${OUTPUT_DIR}/ssl"
+	fi
 
-    ./Configure linux-x86_64 no-shared \
-        --prefix="${OUTPUT_DIR}" \
-        --openssldir="${OUTPUT_DIR}/ssl"
+	echo "══ بناء OpenSSL للينكس (قد يستغرق بعض الوقت) ══"
+	make -j"$(nproc)"
+	make install_dev
 
-    echo "══ بناء OpenSSL للينكس (قد يستغرق بعض الوقت) ══"
-    make -j"$(nproc)"
-    make install_dev
-
-    # [FIX-6] على بعض توزيعات Linux يثبّت OpenSSL المكتبات في lib64 بدلاً من lib
-    # نوحّد المسار بنسخ المحتوى إلى lib حتى يجده FFmpeg و CMake بشكل موثوق
-    if [ -d "${OUTPUT_DIR}/lib64" ] && [ ! -f "${OUTPUT_DIR}/lib/libssl.a" ]; then
-        echo "── lib64 مكتشف → نسخ المحتوى إلى lib ──"
-        mkdir -p "${OUTPUT_DIR}/lib"
-        cp -r "${OUTPUT_DIR}/lib64/." "${OUTPUT_DIR}/lib/"
-        echo "  ✓ تم توحيد المسار: lib64 → lib"
-    fi
+	# [FIX-6] على بعض توزيعات Linux يثبّت OpenSSL المكتبات في lib64 بدلاً من lib
+	# نوحّد المسار بنسخ المحتوى إلى lib حتى يجده FFmpeg و CMake بشكل موثوق
+	if [ -d "${OUTPUT_DIR}/lib64" ] && [ ! -f "${OUTPUT_DIR}/lib/libssl.a" ]; then
+		echo "── lib64 مكتشف → نسخ المحتوى إلى lib ──"
+		mkdir -p "${OUTPUT_DIR}/lib"
+		cp -r "${OUTPUT_DIR}/lib64/." "${OUTPUT_DIR}/lib/"
+		echo "  ✓ تم توحيد المسار: lib64 → lib"
+	fi
 
 # ─── 5. بناء الأندرويد (الافتراضي إذا لم يكن الهدف linux) ───────────────────
 else
