@@ -104,11 +104,7 @@ else
     chmod +x "${SCRIPT_DIR}/build_openssl_android.sh"
     TARGET_PLATFORM="${TARGET_PLATFORM}" TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/build_openssl_android.sh"
 fi
-    log_ok "OpenSSL موجود بالفعل — تجاوز البناء (احذف openssl_build/ لإعادة البناء)"
-else
-    chmod +x "${SCRIPT_DIR}/build_openssl_android.sh"
-    "${SCRIPT_DIR}/build_openssl_android.sh"
-fi
+
 
 log_ok "OpenSSL جاهز: ${OPENSSL_BUILD}"
 
