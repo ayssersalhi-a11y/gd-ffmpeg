@@ -4,7 +4,11 @@ set -e
 # ─── 1. الإعدادات الأساسية ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${SCRIPT_DIR}/openssl_source"
-OUTPUT_DIR="${SCRIPT_DIR}/openssl_build"
+if [ "$TARGET_PLATFORM" = "linux" ]; then
+    OUTPUT_DIR="${SCRIPT_DIR}/openssl_build/linux-${TARGET_ARCH:-x86_64}"
+else
+    OUTPUT_DIR="${SCRIPT_DIR}/openssl_build/android-arm64"
+fi
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.0.13}"
 OPENSSL_URL="https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
 
