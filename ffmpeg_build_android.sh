@@ -15,7 +15,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FFMPEG_SRC_DIR="${SCRIPT_DIR}/ffmpeg_source"
 OUTPUT_DIR="${SCRIPT_DIR}/ffmpeg_build"
-OPENSSL_BUILD="${SCRIPT_DIR}/openssl_build"
+if [ "$TARGET_PLATFORM" = "linux" ]; then
+    OPENSSL_BUILD="${SCRIPT_DIR}/openssl_build/linux-${TARGET_ARCH:-x86_64}"
+else
+    OPENSSL_BUILD="${SCRIPT_DIR}/openssl_build/android-arm64"
+fi
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 
 # ─── 2. بناء Linux (يتم تنفيذه إذا كان TARGET_PLATFORM=linux) ────────────────
