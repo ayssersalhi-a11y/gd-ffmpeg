@@ -95,7 +95,15 @@ log_step "المرحلة 1: بناء OpenSSL ${OPENSSL_VERSION}"
 
 OPENSSL_BUILD="${SCRIPT_DIR}/openssl_build"
 
-if [ -f "${OPENSSL_BUILD}/lib/libssl.a" ] && [ -f "${OPENSSL_BUILD}/lib/libcrypto.a" ]; then
+OPENSSL_SUBDIR="android-arm64"
+[ "${TARGET_PLATFORM}" = "linux" ] && OPENSSL_SUBDIR="linux-${TARGET_ARCH:-x86_64}"
+
+if [ -f "${OPENSSL_BUILD}/${OPENSSL_SUBDIR}/lib/libssl.a" ] && [ -f "${OPENSSL_BUILD}/${OPENSSL_SUBDIR}/lib/libcrypto.a" ]; then
+    log_ok "OpenSSL (${OPENSSL_SUBDIR}) موجود بالفعل — تجاوز البناء"
+else
+    chmod +x "${SCRIPT_DIR}/build_openssl_android.sh"
+    TARGET_PLATFORM="${TARGET_PLATFORM}" TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/build_openssl_android.sh"
+fi
     log_ok "OpenSSL موجود بالفعل — تجاوز البناء (احذف openssl_build/ لإعادة البناء)"
 else
     chmod +x "${SCRIPT_DIR}/build_openssl_android.sh"
