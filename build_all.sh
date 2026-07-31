@@ -139,7 +139,6 @@ if [ "${TARGET_PLATFORM}" = "linux" ] && [ "${TARGET_ARCH}" = "arm64" ]; then
         -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
         -DFFMPEG_DIR="${FFMPEG_BUILD}" \
-        -DOPENSSL_DIR="${OPENSSL_BUILD}" \
         -DCMAKE_VERBOSE_MAKEFILE=OFF
 
     cmake --build "${BUILD_TEMP}/linux_arm64" --parallel "$(nproc)"
@@ -169,7 +168,6 @@ elif [ "${TARGET_PLATFORM}" = "linux" ] && [ "${TARGET_ARCH}" = "x86_64" ]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
         -DFFMPEG_DIR="${FFMPEG_BUILD}" \
-        -DOPENSSL_DIR="${OPENSSL_BUILD}" \
         -DCMAKE_VERBOSE_MAKEFILE=OFF
 
     cmake --build "${BUILD_TEMP}/linux_x86_64" --parallel "$(nproc)"
@@ -199,7 +197,6 @@ else
         -DCMAKE_BUILD_TYPE=Release \
         -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
         -DFFMPEG_DIR="${FFMPEG_BUILD}" \
-        -DOPENSSL_DIR="${OPENSSL_BUILD}" \
         -DCMAKE_VERBOSE_MAKEFILE=OFF
 
     cmake --build "${BUILD_TEMP}/arm64" --parallel "$(nproc)"
