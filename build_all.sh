@@ -105,8 +105,7 @@ else
     TARGET_PLATFORM="${TARGET_PLATFORM}" TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/build_openssl_android.sh"
 fi
 
-
-log_ok "OpenSSL جاهز: ${OPENSSL_BUILD}"
+log_ok "OpenSSL جاهز: ${OPENSSL_BUILD}/${OPENSSL_SUBDIR}"
 
 # ─── المرحلة 2: بناء FFmpeg ────────────────────────────────────────────────────
 log_step "المرحلة 2: بناء FFmpeg ${FFMPEG_VERSION} + OpenSSL"
