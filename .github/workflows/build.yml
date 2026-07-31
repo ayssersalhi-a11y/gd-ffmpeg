@@ -159,22 +159,27 @@ jobs:
       # ── 9. التحقق من OpenSSL قبل البناء ──────────────────────────────────────
       - name: Debug - Check if OpenSSL files exist
         run: |
-          echo "Looking for OpenSSL libraries..."
-
-          if [ -d "${{ github.workspace }}/openssl_build/lib64" ] && [ ! -f "${{ github.workspace }}/openssl_build/lib/libssl.a" ]; then
-            echo "[INFO] Detected lib64 folder, copying contents to lib for compatibility..."
-            mkdir -p "${{ github.workspace }}/openssl_build/lib"
-            cp -r ${{ github.workspace }}/openssl_build/lib64/* ${{ github.workspace }}/openssl_build/lib/
+          OPENSSL_SUBDIR="android-arm64"
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            OPENSSL_SUBDIR="linux-${{ matrix.arch }}"
           fi
 
-          if [ -f "${{ github.workspace }}/openssl_build/lib/libssl.a" ]; then
+          echo "Looking for OpenSSL libraries in: openssl_build/${OPENSSL_SUBDIR}/lib"
+
+          if [ -d "${{ github.workspace }}/openssl_build/${OPENSSL_SUBDIR}/lib64" ] && [ ! -f "${{ github.workspace }}/openssl_build/${OPENSSL_SUBDIR}/lib/libssl.a" ]; then
+            echo "[INFO] Detected lib64 folder, copying contents to lib for compatibility..."
+            mkdir -p "${{ github.workspace }}/openssl_build/${OPENSSL_SUBDIR}/lib"
+            cp -r ${{ github.workspace }}/openssl_build/${OPENSSL_SUBDIR}/lib64/* ${{ github.workspace }}/openssl_build/${OPENSSL_SUBDIR}/lib/
+          fi
+
+          if [ -f "${{ github.workspace }}/openssl_build/${OPENSSL_SUBDIR}/lib/libssl.a" ]; then
             echo "✅ Success: libssl.a found!"
           else
-            echo "::error:: File libssl.a is genuinely missing!"
+            echo "::error:: File libssl.a is genuinely missing at openssl_build/${OPENSSL_SUBDIR}/lib!"
             exit 1
           fi
 
-            # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
+       # ── 10. بناء libgdffmpeg.so ───────────────────────────────────────────────
       - name: Build libgdffmpeg.so
         env:
           NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
