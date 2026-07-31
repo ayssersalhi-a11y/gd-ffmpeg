@@ -156,7 +156,7 @@ fi
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
-echo "║  ✓ OpenSSL جاهز بنجاح!                           ║"
-echo "║  الناتج: openssl_build/include + openssl_build/lib ║"
+echo "║  ✓ OpenSSL جاهز بنجاح!                                      ║"
+echo "║  الناتج: ${OUTPUT_DIR#${SCRIPT_DIR}/}                        ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
