@@ -7,7 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ─── المسارات الأساسية ────────────────────────────────────────────────────────
 set(GODOT_CPP_DIR  "${CMAKE_SOURCE_DIR}/godot-cpp" CACHE PATH "مسار godot-cpp")
 set(FFMPEG_DIR     "${CMAKE_SOURCE_DIR}/ffmpeg_build" CACHE PATH "مسار FFmpeg")
-set(OPENSSL_DIR    "${CMAKE_SOURCE_DIR}/openssl_build" CACHE PATH "مسار OpenSSL")
+set(OPENSSL_BASE_DIR "${CMAKE_SOURCE_DIR}/openssl_build" CACHE PATH "المسار الأساسي لـ OpenSSL")
+
+if(ANDROID)
+    set(OPENSSL_DIR "${OPENSSL_BASE_DIR}/android-arm64")
+else()
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        set(OPENSSL_DIR "${OPENSSL_BASE_DIR}/linux-arm64")
+    else()
+        set(OPENSSL_DIR "${OPENSSL_BASE_DIR}/linux-x86_64")
+    endif()
+endif()
+
+message(STATUS "OPENSSL_DIR resolved to: ${OPENSSL_DIR}")
 
 # ─── اكتشاف المنصة وإعداد المسارات الديناميكية ────────────────────────────────
 if(ANDROID)
