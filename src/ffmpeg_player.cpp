@@ -590,9 +590,23 @@ bool  FFmpegPlayer::is_audio_muted()    const { return audio_muted; }
 String FFmpegPlayer::get_loaded_audio_path() const { return loaded_audio_path; }
 
 // ─── ساعة الصوت ───────────────────────────────────────────────────────────────
+// ─── ساعة الصوت (مُصلَح: تعويض ديناميكي لتأخير البافر الداخلي) ──────────────
 double FFmpegPlayer::_get_audio_clock() const {
     if (!audio_clock_active) return position;
-    return audio_clock_offset + (double)audio_samples_pushed / godot_mix_rate;
+
+    double raw_clock = audio_clock_offset + (double)audio_samples_pushed / godot_mix_rate;
+
+    // [تصحيح التأخير] اطرح مدة الصوت الذي ضُخّ لكنه لا يزال ينتظر دوره
+    // داخل بافر AudioStreamGenerator (لم يُسمَع بعد فعلياً)
+    if (int_audio_playback.is_valid() && int_audio_generator.is_valid()) {
+        int avail_f = int_audio_playback->get_frames_available();
+        int total_f = (int)(godot_mix_rate * int_audio_generator->get_buffer_length());
+        int buffered_unplayed = total_f - avail_f;
+        if (buffered_unplayed > 0)
+            raw_clock -= (double)buffered_unplayed / godot_mix_rate;
+    }
+
+    return raw_clock;
 }
 void FFmpegPlayer::_reset_audio_clock(double pos) {
     audio_clock_offset   = pos;
