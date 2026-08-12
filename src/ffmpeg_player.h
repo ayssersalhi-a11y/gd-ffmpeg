@@ -208,7 +208,7 @@ private:
     bool  audio_muted  = false;
 
     // ── [I] ثوابت بافر الصوت ────────────────────────────────────────────────
-    static constexpr double AUDIO_BUFFER_MAX_MS = 200.0;
+    static constexpr double AUDIO_BUFFER_MAX_MS = 250.0;
     static constexpr double AUDIO_MIN_PUSH_MS   =  20.0;
 
     // ── [J] مؤقت إشارات الحالة ──────────────────────────────────────────────
