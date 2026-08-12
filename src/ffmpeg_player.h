@@ -225,7 +225,7 @@ private:
 
     // [11] Hard Frame Drop + GPU Latency
     static constexpr double HARD_DROP_THRESHOLD = 0.020; 
-    static constexpr double GPU_LATENCY_OFFSET  = -0.050; 
+    static constexpr double GPU_LATENCY_OFFSET  = -0.020; 
 
     // ── الدوال الداخلية ──────────────────────────────────────────────────────
     bool _setup_video_codec(AVStream *vstream);
