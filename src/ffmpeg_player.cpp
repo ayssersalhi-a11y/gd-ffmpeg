@@ -227,7 +227,7 @@ bool FFmpegPlayer::load_video(const String &path) {
                 audio_sample_rate = rate; audio_channels = ch;
                 int_audio_generator.instantiate();
                 int_audio_generator->set_mix_rate((float)godot_mix_rate);
-                int_audio_generator->set_buffer_length(0.15);
+                int_audio_generator->set_buffer_length(0.30);
                 int_audio_player->set_stream(int_audio_generator);
             } else {
                 UtilityFunctions::printerr("[AUDIO] Internal setup failed, video-only.");
@@ -415,7 +415,7 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (int_audio_generator.is_null()) {
         int_audio_generator.instantiate();
         int_audio_generator->set_mix_rate((float)godot_mix_rate);
-        int_audio_generator->set_buffer_length(0.15);
+        int_audio_generator->set_buffer_length(0.30);
         int_audio_player->set_stream(int_audio_generator);
     }
 
@@ -699,7 +699,7 @@ void FFmpegPlayer::_fill_silence(int n) {
     int_audio_playback->push_buffer(silence);
 }
 
-// ─── [8+9+10] ضخ الصوت مع جميع ضمانات الجودة ────────────────────────────────
+// ─── [8+9+10] ضخ الصوت مع جميع ضمانات الجودة (مُصلَح: عدم فقد العينات) ───────
 void FFmpegPlayer::_push_audio_frames(
     std::deque<AVFrame*> &frame_queue, SwrContext *swr, int src_rate)
 {
@@ -726,13 +726,13 @@ void FFmpegPlayer::_push_audio_frames(
         if (buf_ms >= AUDIO_BUFFER_MAX_MS) break;
 
         AVFrame *af = frame_queue.front();
-        frame_queue.pop_front();
 
-        // [7] كشف الفجوة الزمنية بين الإطارات
+        // [7] كشف الفجوة الزمنية بين الإطارات (يُفحص قبل السحب من الطابور)
         if (af->pts != AV_NOPTS_VALUE && last_audio_pts >= 0.0) {
             double cur_pts = af->pts * (src_rate > 0 ? 1.0 / src_rate : 1.0 / godot_mix_rate);
             double gap     = cur_pts - last_audio_pts;
             if (gap > AUDIO_GAP_RESYNC_S) {
+                frame_queue.pop_front();
                 av_frame_free(&af);
                 _handle_audio_gap(gap); return;
             }
@@ -746,15 +746,22 @@ void FFmpegPlayer::_push_audio_frames(
         int out_n = av_rescale_rnd(
             swr_get_delay(swr, src) + af->nb_samples,
             godot_mix_rate, src, AV_ROUND_UP);
-        if (out_n <= 0) { av_frame_free(&af); continue; }
+        if (out_n <= 0) {
+            frame_queue.pop_front();
+            av_frame_free(&af);
+            continue;
+        }
 
         std::vector<float> buf(out_n * 2, 0.0f);
         uint8_t *ptr = (uint8_t *)buf.data();
 
         int conv = swr_convert(swr, &ptr, out_n,
             (const uint8_t **)af->data, af->nb_samples);
-        av_frame_free(&af);
-        if (conv <= 0) continue;
+        if (conv <= 0) {
+            frame_queue.pop_front();
+            av_frame_free(&af);
+            continue;
+        }
 
         PackedVector2Array stereo;
         stereo.resize(conv);
@@ -769,12 +776,20 @@ void FFmpegPlayer::_push_audio_frames(
             w[i] = Vector2(l, r);
         }
 
+        // [مُصلَح] لا نحذف الإطار من الطابور إلا بعد نجاح الضخ الفعلي
         if (int_audio_playback->push_buffer(stereo)) {
+            frame_queue.pop_front();
+            av_frame_free(&af);
             audio_samples_pushed += conv;
             audio_clock_active    = true;
+        } else {
+            // البافر ممتلئ فعلياً رغم الحساب — توقف هنا واترك الإطار لمحاولة لاحقة
+            // لا تحذف العينات، ولا تسحب الإطار من الطابور
+            break;
         }
     }
 }
+
 
 // ─── play ─────────────────────────────────────────────────────────────────────
 void FFmpegPlayer::play() {
