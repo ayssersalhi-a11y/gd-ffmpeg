@@ -2,9 +2,26 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار 6.0 — استقرار متكامل + مزامنة دقيقة
+ * الإصدار 6.2 — إنهاء حقيقي (EOF) + أولوية صوت ذكية (خارجي إن توفر، داخلي كاحتياطي)
  *
- * ─── التحسينات الجديدة (v5→v6) ──────────────────────────────────────────────
+ * ─── الجديد في v6.2 ──────────────────────────────────────────────────────────
+ *
+ *  [EOF] الإنهاء الحقيقي:
+ *        video_finished الآن يعتمد على نفاد الديموكسر فعليًا (AVERROR_EOF)
+ *        وتفريغ كل الطوابير، بدل مقارنة position >= duration التي كانت
+ *        تفشل بسبب GPU_LATENCY_OFFSET السالب.
+ *
+ *  [AUDIO-FALLBACK] أولوية مصدر الصوت:
+ *        يُشغَّل الصوت المدمج مع الفيديو تلقائيًا وفوريًا عند التشغيل (سواء
+ *        كان الفيديو محليًا أو رابط شبكة). إذا استُدعيت load_audio() برابط
+ *        صوت خارجي صالح، يتم التبديل إليه بسلاسة فور جاهزيته (بلا فجوة صمت)
+ *        ويتوقف الصوت الداخلي. إذا فشل تحميل الصوت الخارجي أو لم يُطلب
+ *        إطلاقًا، يستمر الصوت الداخلي المدمج تلقائيًا كخيار افتراضي/احتياطي.
+ *        هذا يتيح تبديل اللغة (دبلجة) عبر رابط صوت خارجي دون رفع نسخ فيديو
+ *        متكررة، مع بقاء الفيديو قابلاً للتشغيل بصوته الأصلي عند عدم وجود
+ *        رابط دبلجة.
+ *
+ * ─── التحسينات السابقة (v5→v6) ──────────────────────────────────────────────
  *
  *  [6]  Audio Overrun Protection:
  *       decoded_audio_queue / ext_audio_frame_queue تُمسح بالكامل عند كل
@@ -29,11 +46,12 @@
  *
  *  [11] Hard Frame Drop + GPU Latency Offset:
  *       إذا تأخر الفيديو عن الصوت > HARD_DROP_THRESHOLD (20ms)
- *       يُسقَط الإطار فوراً. GPU_LATENCY_OFFSET = -0.05s لتعويض تأخر العرض.
+ *       يُسقَط الإطار فوراً. GPU_LATENCY_OFFSET = -0.02s لتعويض تأخر العرض
+ *       (يُستخدم فقط لمزامنة العرض البصري، وليس لاكتشاف نهاية التشغيل).
  *
  *  [12] إصلاح فتح روابط الصوت HTTP/HTTPS:
  *       خيارات avformat محسّنة: timeout/rw_timeout، إزالة reconnect_streamed،
- *       إضافة http_persistent=0، seekable=1 لروابط الملفات الثابتة.
+ *       إضافة http_persistent=0، seekable=0 (وضع Streaming نقي).
  */
 
 #pragma once
@@ -162,7 +180,7 @@ private:
     std::deque<DecodedFrame> decoded_frame_queue;
     std::deque<AVFrame*>     decoded_audio_queue;
     std::deque<AVFrame*>     ext_audio_frame_queue;
-    
+
     // خيوط المعالجة الخلفية والتحكم بالصوت الشبكي
     std::thread audio_loading_thread;
     std::atomic<bool> audio_loading_thread_running{false};
@@ -176,7 +194,8 @@ private:
     bool   looping            = false;
     bool   buffering          = false;
     bool   is_live_stream     = false;
-    bool   use_external_audio = false;
+    bool   use_external_audio = false;   // v6.2: يعكس الآن حالة التشغيل الفعلية
+                                          // (true فقط بعد نجاح تفعيل مصدر خارجي)
     double position           = 0.0;
     double stream_start_time  = 0.0;
     double frame_timer        = 0.0;
@@ -215,17 +234,36 @@ private:
     double status_timer = 0.0;
     static constexpr double STATUS_INTERVAL = 0.5;
 
-    // ── [K] ثوابت الاستشعار الزمني الجديدة (v6) ─────────────────────────────
+    // ── [K] ثوابت الاستشعار الزمني (v6) ─────────────────────────────────────
 
     // [7] Audio Auto-Recovery
-    double last_audio_pts       = -1.0; 
+    double last_audio_pts       = -1.0;
     bool   audio_resync_needed  = false;
-    static constexpr double AUDIO_GAP_RESYNC_S = 0.5;  
-    static constexpr double AUDIO_GAP_SKIP_S   = 1.0;  
+    static constexpr double AUDIO_GAP_RESYNC_S = 0.5;
+    static constexpr double AUDIO_GAP_SKIP_S   = 1.0;
 
     // [11] Hard Frame Drop + GPU Latency
-    static constexpr double HARD_DROP_THRESHOLD = 0.020; 
-    static constexpr double GPU_LATENCY_OFFSET  = -0.020; 
+    static constexpr double HARD_DROP_THRESHOLD = 0.020;
+    static constexpr double GPU_LATENCY_OFFSET  = -0.020;
+
+    // ── [L] الإنهاء الحقيقي (EOF من الديموكسر، v6.2) ────────────────────────
+    // true فقط عندما يُعيد av_read_frame على fmt_ctx الرئيسي القيمة AVERROR_EOF
+    // فعليًا (نفاد البيانات من المصدر)، لا عند وصول position إلى duration.
+    bool demux_eof_reached = false;
+
+    // ── [M] أولوية مصدر الصوت (v6.2) ─────────────────────────────────────────
+    enum class AudioActiveSource {
+        NONE,               // لا يوجد أي مسار صوت (فيديو بلا صوت إطلاقًا)
+        INTERNAL_EMBEDDED,  // الصوت المدمج داخل حاوية الفيديو نفسها (افتراضي)
+        EXTERNAL_STREAM,    // صوت خارجي عبر FFmpeg (رابط شبكة، عبر المولّد المشترك)
+        EXTERNAL_LOCAL_FILE // صوت خارجي عبر مشغّل Godot المستقل (res:// / user:// / mp3 / ogg)
+    };
+    AudioActiveSource audio_active_source = AudioActiveSource::NONE;
+
+    // true بمجرد استدعاء load_audio() بمسار غير فارغ (سواء نجح التحميل بعد أم لا)
+    bool external_audio_requested = false;
+    // true فقط بعد أن يصبح المصدر الخارجي جاهزًا فعليًا وتم التبديل إليه
+    bool external_audio_ready     = false;
 
     // ── الدوال الداخلية ──────────────────────────────────────────────────────
     bool _setup_video_codec(AVStream *vstream);
@@ -247,7 +285,7 @@ private:
 
     // [8+9+10+11] ضخ الصوت
     void _push_audio_frames(std::deque<AVFrame*> &queue, SwrContext *swr, int src_rate);
-    void _fill_silence(int frames_count); 
+    void _fill_silence(int frames_count);
 
     // [11] عرض الإطار
     bool _present_frame_at(double pos);
@@ -263,8 +301,13 @@ private:
     void _resume_audio(double pos);
     void _reset_audio_clock(double pos);
 
+    // [M] مساعدات أولوية مصدر الصوت (v6.2)
+    void _flush_internal_audio_queues();
+    void _switch_to_external_local_file(const Ref<AudioStream> &stream, const String &path);
+    void _revert_to_internal_audio();
+
     void _allocate_buffers();
-    void _clear_queues();   
+    void _clear_queues();
     void _cleanup();
 
     void _emit_video_loaded(bool success);
