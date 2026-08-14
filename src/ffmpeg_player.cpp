@@ -2,7 +2,20 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 6.1 — إصلاح AVERROR_INVALIDDATA + تحسين تشخيص البناء
+ * الإصدار 6.2 — إنهاء حقيقي (EOF) + أولوية صوت ذكية (خارجي إن توفر، داخلي كاحتياطي)
+ *
+ * ─── ما الجديد في v6.2 ────────────────────────────────────────────────────────
+ *
+ * [EOF-FIX] استبدال شرط "position >= duration" (الذي كان لا يتحقق أبدًا بسبب
+ *           GPU_LATENCY_OFFSET السالب) باكتشاف EOF حقيقي من الديموكسر عبر
+ *           av_read_frame() == AVERROR_EOF + تفريغ كل الطوابير (فيديو/صوت،
+ *           داخلي/خارجي) قبل إطلاق video_finished.
+ *
+ * [AUDIO-FALLBACK] الصوت المدمج مع الفيديو يُشغَّل تلقائيًا وفوريًا (محليًا
+ *           كان الفيديو أو رابط شبكة). إذا استُدعيت load_audio() برابط صوت
+ *           خارجي صالح، يتم التبديل السلس إليه فور جاهزيته (بلا فجوة صمت)
+ *           ويتوقف الصوت الداخلي تلقائيًا. إذا فشل تحميل الخارجي أو لم يُطلب
+ *           إطلاقًا، يستمر الصوت الداخلي المدمج كخيار افتراضي/احتياطي دائم.
  *
  * ─── ما الجديد في v6.1 ───────────────────────────────────────────────────────
  *
@@ -13,7 +26,8 @@
  *
  * [FIX-2] إصلاح منطق load_audio() — كان يرفض صامتاً روابط HTTP/HTTPS
  *         إذا كان الفيديو محلياً (use_external_audio=false). الآن يُتحقق
- *         من مسار الصوت نفسه بشكل مستقل عن مصدر الفيديو.
+ *         من مسار الصوت نفسه بشكل مستقل عن مصدر الفيديو (ومنذ v6.2 أصبح
+ *         مستقلاً تمامًا عن نوع الفيديو في كل الحالات).
  *
  * [FIX-3] تشخيص بناء المكتبة في _ready():
  *         طباعة جميع البروتوكولات المتاحة (avio_enum_protocols) لتأكيد
@@ -129,7 +143,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v6.1 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v6.2 ---");
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
@@ -157,14 +171,16 @@ bool FFmpegPlayer::load_video(const String &path) {
 
     if (path.is_empty()) { _emit_playback_error("Path is empty"); return false; }
 
-    is_live_stream     = path.begins_with("rtmp://") || path.begins_with("rtsp://");
-    use_external_audio = path.begins_with("http://")  || path.begins_with("https://");
-    bool is_network    = is_live_stream || use_external_audio;
+    is_live_stream  = path.begins_with("rtmp://") || path.begins_with("rtsp://");
+    // [v6.2] لم يعد "use_external_audio" يُشتق من نوع مسار الفيديو؛ أصبح
+    // يعكس ديناميكيًا ما إذا كان مصدر صوت خارجي نشطًا فعليًا الآن (انظر
+    // _switch_to_external_local_file / معالج audio_load_finished_successfully).
+    bool video_is_network = path.begins_with("http://") || path.begins_with("https://");
+    bool is_network        = is_live_stream || video_is_network;
 
     UtilityFunctions::print("[LOAD] Mode: ",
-        use_external_audio ? "Direct URL (external audio)" :
-        is_live_stream     ? "Live Stream (internal audio)" :
-                             "Local File (internal audio)");
+        is_live_stream ? "Live Stream" : (video_is_network ? "Direct URL" : "Local File"),
+        " | Audio: internal (embedded) by default, external overrides via load_audio()");
 
     if (path.ends_with(".m3u") || path.contains(".m3u?")) {
         _emit_playback_error("M3U_DETECTED"); return false;
@@ -217,25 +233,29 @@ bool FFmpegPlayer::load_video(const String &path) {
         _cleanup(); _emit_video_loaded(false); return false;
     }
 
-    if (!use_external_audio) {
-        audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-        if (audio_stream_idx >= 0) {
-            AVCodecContext *ac = nullptr; SwrContext *sw = nullptr;
-            int rate = 0, ch = 0;
-            if (_setup_audio_codec(fmt_ctx->streams[audio_stream_idx], ac, sw, rate, ch)) {
-                audio_codec_ctx = ac; swr_ctx = sw;
-                audio_sample_rate = rate; audio_channels = ch;
-                int_audio_generator.instantiate();
-                int_audio_generator->set_mix_rate((float)godot_mix_rate);
-                int_audio_generator->set_buffer_length(0.30);
-                int_audio_player->set_stream(int_audio_generator);
-            } else {
-                UtilityFunctions::printerr("[AUDIO] Internal setup failed, video-only.");
-                audio_stream_idx = -1;
-            }
+    // ── [AUDIO-FALLBACK v6.2] الصوت الداخلي المدمج دائمًا هو الخيار الافتراضي ──
+    // يُعدّ دائمًا بغض النظر عن كون الفيديو محليًا أو رابط شبكة، لأنه سيُستخدم
+    // فورًا ما لم يُطلب صوت خارجي عبر load_audio() لاحقًا وينجح تحميله.
+    audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audio_stream_idx >= 0) {
+        AVCodecContext *ac = nullptr; SwrContext *sw = nullptr;
+        int rate = 0, ch = 0;
+        if (_setup_audio_codec(fmt_ctx->streams[audio_stream_idx], ac, sw, rate, ch)) {
+            audio_codec_ctx = ac; swr_ctx = sw;
+            audio_sample_rate = rate; audio_channels = ch;
+            int_audio_generator.instantiate();
+            int_audio_generator->set_mix_rate((float)godot_mix_rate);
+            int_audio_generator->set_buffer_length(0.30);
+            int_audio_player->set_stream(int_audio_generator);
+            audio_active_source = AudioActiveSource::INTERNAL_EMBEDDED;
+            UtilityFunctions::print("[AUDIO] Internal (embedded) track ready — active by default");
+        } else {
+            UtilityFunctions::printerr("[AUDIO] Internal setup failed, video-only.");
+            audio_stream_idx = -1;
+            audio_active_source = AudioActiveSource::NONE;
         }
     } else {
-        audio_stream_idx = -1;
+        audio_active_source = AudioActiveSource::NONE;
     }
 
     duration = (fmt_ctx->duration != AV_NOPTS_VALUE)
@@ -371,18 +391,18 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     UtilityFunctions::print("[DEBUG-AUDIO] Attempting to open URL: ", path);
 
     int ret = avformat_open_input(&ext_fmt_ctx, utf8.get_data(), nullptr, &opts);
-    
+
     if (ret < 0) {
         av_dict_free(&opts);
-        
+
         // --- تحويل كود الخطأ إلى نص مفهوم ---
         char err_buf[256];
-        av_strerror(ret, err_buf, sizeof(err_buf)); 
+        av_strerror(ret, err_buf, sizeof(err_buf));
         String error_msg = "[FFmpeg Critical] " + String(err_buf) + " (Error Code: " + String::num(ret) + ")";
-        
-        UtilityFunctions::printerr(error_msg); 
-        _emit_playback_error(error_msg);       
-        emit_signal("audio_loaded", false); 
+
+        UtilityFunctions::printerr(error_msg);
+        _emit_playback_error(error_msg);
+        emit_signal("audio_loaded", false);
         return false;
     }
     av_dict_free(&opts);
@@ -391,7 +411,7 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (avformat_find_stream_info(ext_fmt_ctx, nullptr) < 0) {
         avformat_close_input(&ext_fmt_ctx);
         _emit_playback_error("[DEBUG-AUDIO] Failed to find stream info after opening.");
-        emit_signal("audio_loaded", false); 
+        emit_signal("audio_loaded", false);
         return false;
     }
 
@@ -399,7 +419,7 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (ext_audio_stream < 0) {
         avformat_close_input(&ext_fmt_ctx);
         _emit_playback_error("[DEBUG-AUDIO] No audio stream found in this URL.");
-        emit_signal("audio_loaded", false); 
+        emit_signal("audio_loaded", false);
         return false;
     }
 
@@ -407,7 +427,7 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     if (!_setup_audio_codec(ext_fmt_ctx->streams[ext_audio_stream], ext_audio_ctx, ext_swr_ctx, rate, ch)) {
         avformat_close_input(&ext_fmt_ctx);
         _emit_playback_error("[DEBUG-AUDIO] Codec setup failed for external audio.");
-        emit_signal("audio_loaded", false); 
+        emit_signal("audio_loaded", false);
         return false;
     }
 
@@ -422,7 +442,7 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     ext_audio_eof = false;
     ext_using_godot_player = false;
     _reset_last_audio_pts();
-    
+
     UtilityFunctions::print("[DEBUG-AUDIO] Success! Audio is ready to play.");
     emit_signal("audio_loaded", true);
     return true;
@@ -459,70 +479,117 @@ void FFmpegPlayer::_allocate_buffers() {
     UtilityFunctions::print("[MEM] Ready: ", video_width, "x", video_height);
 }
 
-// ─── تحميل الصوت الخارجي ─────────────────────────────────────────────────────
+// ─── [M v6.2] مساعدات أولوية مصدر الصوت ──────────────────────────────────────
 
-bool FFmpegPlayer::load_audio(const String &path) {
-    bool path_is_network = path.begins_with("http://") || path.begins_with("https://");
-    if (!use_external_audio && !path_is_network) {
-        UtilityFunctions::print("[AUDIO] load_audio() ignored: internal audio mode");
-        return false;
+// يفرّغ طوابير الصوت الداخلي (المُفكَّك وغير المُفكَّك) بأمان — يُستخدم عند
+// التبديل إلى مصدر خارجي لمنع تراكب الصوتين لحظة التبديل.
+void FFmpegPlayer::_flush_internal_audio_queues() {
+    for (auto *f : decoded_audio_queue) av_frame_free(&f);
+    decoded_audio_queue.clear();
+    while (!audio_packet_queue.empty()) {
+        av_packet_free(&audio_packet_queue.front());
+        audio_packet_queue.pop_front();
     }
-    
-    // إيقاف المشغلات بأمان
-    if (ext_audio_player && ext_audio_player->is_playing()) ext_audio_player->stop();
+}
+
+// تبديل فوري إلى صوت خارجي محلي (مشغَّل عبر AudioStreamPlayer مستقل، مثل
+// res:// / user:// أو ملف .mp3/.ogg مطلق) — يوقف الصوت الداخلي بالكامل.
+void FFmpegPlayer::_switch_to_external_local_file(const Ref<AudioStream> &stream, const String &path) {
     if (int_audio_player && int_audio_player->is_playing()) int_audio_player->stop();
+    int_audio_playback.unref();
+    _flush_internal_audio_queues();
+
+    ext_audio_player->set_stream(stream);
+    loaded_audio_path = path;
+    ext_using_godot_player = true;
+    use_external_audio     = true;
+    audio_active_source    = AudioActiveSource::EXTERNAL_LOCAL_FILE;
+    external_audio_ready   = true;
+
+    _apply_audio_volume();
+    if (playing && !buffering) ext_audio_player->play((float)position);
+}
+
+// عودة صريحة إلى الصوت الداخلي المدمج (عند استدعاء load_audio("") أو عند
+// فشل التحميل الخارجي) — الصوت الداخلي غالبًا لم يتوقف أصلاً، هذا يضمن ذلك.
+void FFmpegPlayer::_revert_to_internal_audio() {
+    if (ext_audio_player && ext_audio_player->is_playing()) ext_audio_player->stop();
+    ext_using_godot_player = false;
+
+    external_audio_requested = false;
+    external_audio_ready     = false;
+    use_external_audio       = false;
+
+    audio_active_source = (audio_stream_idx >= 0 && swr_ctx)
+        ? AudioActiveSource::INTERNAL_EMBEDDED
+        : AudioActiveSource::NONE;
+
+    if (playing && !buffering) {
+        _start_audio_at(position);
+    }
+}
+
+// ─── تحميل الصوت الخارجي ─────────────────────────────────────────────────────
+// [v6.2] لم يعد مرتبطًا بنوع الفيديو إطلاقًا: يمكن استدعاؤه دائمًا. الصوت
+// الداخلي المدمج يستمر بالعمل دون انقطاع أثناء التحميل (خاصة الشبكي غير
+// المتزامن)، ولا يتم التبديل إلا بعد نجاح التحميل الفعلي — بلا فجوة صمت.
+bool FFmpegPlayer::load_audio(const String &path) {
+    // إيقاف مشغل الصوت الخارجي المستقل القديم بأمان (إن كان يعمل)
+    if (ext_audio_player && ext_audio_player->is_playing()) ext_audio_player->stop();
 
     // تأمين الخيط: إذا كان هناك خيط يعمل حالياً، ننتظر نهايته لضمان سلامة الذاكرة
     if (audio_loading_thread_running) {
         if (audio_loading_thread.joinable()) {
-            audio_loading_thread.join(); 
+            audio_loading_thread.join();
         }
     }
 
-    // مسح طوابير الصوت القديمة تماماً
-    for (auto *f : decoded_audio_queue)    av_frame_free(&f);
-    decoded_audio_queue.clear();
+    // مسح مصدر الصوت الخارجي القديم فقط. الصوت الداخلي (المدمج) لا يُلمَس هنا
+    // إطلاقًا — يستمر تلقائيًا كاحتياطي حتى لحظة نجاح المصدر الجديد فعليًا.
     _cleanup_ext_audio();
     ext_using_godot_player = false;
-    int_audio_playback.unref();
-    _reset_audio_clock(position);
-    audio_load_finished_successfully = false; // إعادة تهيئة العلم
+    audio_load_finished_successfully = false;
 
     if (path.is_empty()) {
-        loaded_audio_path = ""; emit_signal("audio_loaded", false); return false;
+        // طلب صريح بإلغاء أي صوت خارجي → عودة فورية للصوت الداخلي المدمج
+        loaded_audio_path = "";
+        _revert_to_internal_audio();
+        emit_signal("audio_loaded", false);
+        return false;
     }
 
-    // الروابط الشبكية
+    external_audio_requested = true;
+
+    // الروابط الشبكية: تحميل غير متزامن (الصوت الداخلي يستمر حتى ينجح التحميل)
     if (path.begins_with("http://") || path.begins_with("https://")) {
         loaded_audio_path = path;
         audio_loading_thread_running = true;
-        
-        // إطلاق الخيط والاحتفاظ به في الكلاس (بدون استخدام detach!)
         audio_loading_thread = std::thread(&FFmpegPlayer::_open_audio_async_worker, this, path);
-        return true; 
+        return true;
     }
 
-    // الأكواد المحلية res:// و user:// والمصادر المطلقة تظل كما هي سريعة
+    // res:// أو user:// — تبديل متزامن وفوري
     if (path.begins_with("res://") || path.begins_with("user://")) {
         Ref<Resource> res = ResourceLoader::get_singleton()->load(path);
         Ref<AudioStream> s = res;
         if (s.is_null()) {
             _emit_playback_error("Cannot load: " + path);
-            emit_signal("audio_loaded", false); return false;
+            emit_signal("audio_loaded", false);
+            external_audio_requested = false;
+            return false;
         }
-        ext_audio_player->set_stream(s);
-        loaded_audio_path = path;
-        ext_using_godot_player = true;
-        _apply_audio_volume();
-        if (playing && !buffering) ext_audio_player->play((float)position);
+        _switch_to_external_local_file(s, path);
         emit_signal("audio_loaded", true);
         return true;
     }
 
+    // مسار ملف محلي مطلق (.mp3 / .ogg خارج res:// أو user://)
     Ref<FileAccess> fa = FileAccess::open(path, FileAccess::READ);
     if (fa.is_null()) {
         _emit_playback_error("Audio file not found: " + path);
-        emit_signal("audio_loaded", false); return false;
+        emit_signal("audio_loaded", false);
+        external_audio_requested = false;
+        return false;
     }
     PackedByteArray data = fa->get_buffer(fa->get_length()); fa.unref();
 
@@ -534,17 +601,17 @@ bool FFmpegPlayer::load_audio(const String &path) {
         s = AudioStreamOggVorbis::load_from_buffer(data);
     } else {
         _emit_playback_error("Unsupported format: " + path);
-        emit_signal("audio_loaded", false); return false;
+        emit_signal("audio_loaded", false);
+        external_audio_requested = false;
+        return false;
     }
     if (s.is_null()) {
         _emit_playback_error("Audio decode failed: " + path);
-        emit_signal("audio_loaded", false); return false;
+        emit_signal("audio_loaded", false);
+        external_audio_requested = false;
+        return false;
     }
-    ext_audio_player->set_stream(s);
-    loaded_audio_path = path;
-    ext_using_godot_player = true;
-    _apply_audio_volume();
-    if (playing && !buffering) ext_audio_player->play((float)position);
+    _switch_to_external_local_file(s, path);
     emit_signal("audio_loaded", true);
     return true;
 }
@@ -553,15 +620,15 @@ bool FFmpegPlayer::load_audio(const String &path) {
 // ─── دالة العامل الخلفي لفتح الصوت الشبكي (جديدة ومساعدة) ──────────────────────────
 void FFmpegPlayer::_open_audio_async_worker(String path) {
     bool ok = _open_audio_with_ffmpeg(path);
-    
+
     if (ok) {
         // نكتفي برفع العلم فقط، ولا نستدعي _start_audio_at من هنا!
-        audio_load_finished_successfully = true; 
+        audio_load_finished_successfully = true;
     } else {
         audio_load_finished_successfully = false;
     }
-    
-    audio_loading_thread_running = false; 
+
+    audio_loading_thread_running = false;
 }
 
 void FFmpegPlayer::unload_audio() {
@@ -574,6 +641,8 @@ void FFmpegPlayer::unload_audio() {
     ext_using_godot_player = false;
     int_audio_playback.unref();
     loaded_audio_path = "";
+    // [v6.2] بعد إلغاء تحميل الصوت الخارجي، نعود تلقائيًا للصوت الداخلي المدمج
+    _revert_to_internal_audio();
 }
 
 // ─── مستوى الصوت ──────────────────────────────────────────────────────────────
@@ -858,6 +927,8 @@ void FFmpegPlayer::seek(double seconds) {
     } else {
         // Full Seek
         _clear_queues(); // [6] يمسح كل شيء
+        // [v6.2] لم نعد عند EOF بعد أي seek ناجح
+        demux_eof_reached = false;
 
         int64_t ts = (int64_t)(seconds / av_q2d(fmt_ctx->streams[video_stream_idx]->time_base));
         if (av_seek_frame(fmt_ctx, video_stream_idx, ts, AVSEEK_FLAG_BACKWARD) < 0) {
@@ -883,6 +954,7 @@ void FFmpegPlayer::seek(double seconds) {
             ext_audio_pkt_queue.clear();
             for (auto *f : ext_audio_frame_queue)  av_frame_free(&f);
             ext_audio_frame_queue.clear();
+            ext_audio_eof = false;
         }
 
         position = seconds; frame_timer = 0.0; forward_buffer_secs = 0.0;
@@ -910,6 +982,14 @@ void FFmpegPlayer::_process(double delta) {
     // التحقق الآمن من نجاح تحميل الصوت الشبكي في الخيط الرئيسي
     if (audio_load_finished_successfully) {
         audio_load_finished_successfully = false; // تصفير العلم فوراً لمنع التكرار
+
+        // [v6.2] نجح تحميل الصوت الخارجي الشبكي — تبديل سلس وفوري إلى المصدر
+        // الخارجي، مع تفريغ الصوت الداخلي لمنع تراكب الصوتين لحظة التبديل.
+        external_audio_ready = true;
+        use_external_audio   = true;
+        audio_active_source  = AudioActiveSource::EXTERNAL_STREAM;
+        _flush_internal_audio_queues();
+
         if (playing && !buffering) {
             _start_audio_at(position); // تشغيل آمن ومستقر تماماً!
         }
@@ -922,8 +1002,10 @@ void FFmpegPlayer::_process(double delta) {
         _read_packets_to_queue();
         _read_ext_audio_packets();
         _decode_packets_into_queue();
-        _decode_audio_into_queue();
-        _decode_ext_audio_into_queue();
+        if (audio_active_source == AudioActiveSource::INTERNAL_EMBEDDED)
+            _decode_audio_into_queue();
+        if (external_audio_requested && ext_audio_ctx)
+            _decode_ext_audio_into_queue();
 
         if (forward_buffer_secs >= INITIAL_PLAY || !decoded_frame_queue.empty()) {
             buffering = false;
@@ -946,16 +1028,19 @@ void FFmpegPlayer::_process(double delta) {
                               (audio_stream_idx >= 0 || ext_audio_stream >= 0);
 
     if (using_ffmpeg_audio) {
-        // [11] تطبيق GPU Latency Offset على ساعة الصوت
+        // [11] تطبيق GPU Latency Offset على ساعة الصوت (لمزامنة العرض البصري
+        // فقط — لا يُستخدم إطلاقًا لتحديد نهاية التشغيل، انظر شرط EOF أسفله)
         double audio_clk = _get_audio_clock() + GPU_LATENCY_OFFSET;
         double drift     = position - audio_clk; // موجب = فيديو سابق
 
         if (drift > 1.5 / fps) {
             // الفيديو متقدم على الصوت: لا تقدم position
             if (!ext_using_godot_player) {
-                if (audio_stream_idx >= 0 && swr_ctx)
+                if (audio_active_source == AudioActiveSource::INTERNAL_EMBEDDED &&
+                    audio_stream_idx >= 0 && swr_ctx)
                     _push_audio_frames(decoded_audio_queue, swr_ctx, audio_sample_rate);
-                else if (ext_audio_stream >= 0 && ext_swr_ctx)
+                else if (audio_active_source == AudioActiveSource::EXTERNAL_STREAM &&
+                         ext_audio_stream >= 0 && ext_swr_ctx)
                     _push_audio_frames(ext_audio_frame_queue, ext_swr_ctx, 0);
             }
             return;
@@ -983,19 +1068,29 @@ void FFmpegPlayer::_process(double delta) {
 
     if ((int)decoded_frame_queue.size() < MAX_DECODED_FRAMES)
         _decode_packets_into_queue();
-    if ((int)decoded_audio_queue.size() < MAX_AUDIO_FRAMES)
+
+    // [v6.2] نفك تشفير الصوت الداخلي فقط طالما هو المصدر النشط حاليًا —
+    // بمجرد التبديل لمصدر خارجي نتوقف عن استهلاك موارد إضافية عليه.
+    if (audio_active_source == AudioActiveSource::INTERNAL_EMBEDDED &&
+        (int)decoded_audio_queue.size() < MAX_AUDIO_FRAMES)
         _decode_audio_into_queue();
-    if ((int)ext_audio_frame_queue.size() < MAX_AUDIO_FRAMES)
+
+    // [v6.2] نفك تشفير الصوت الخارجي الشبكي طالما طُلب (سواء كان نشطًا الآن
+    // أو ما زال قيد التحميل بالخلفية) حتى يكون جاهزًا فور نجاح التحميل.
+    if (external_audio_requested && ext_audio_ctx &&
+        (int)ext_audio_frame_queue.size() < MAX_AUDIO_FRAMES)
         _decode_ext_audio_into_queue();
 
     // عرض الإطار الحالي على الشاشة
     _present_frame_at(position);
 
-    // ضخ عينات الصوت إلى البافر
+    // ضخ عينات الصوت إلى البافر — من المصدر النشط فقط (لا تراكب بين مصدرين)
     if (!ext_using_godot_player) {
-        if (audio_stream_idx >= 0 && swr_ctx)
+        if (audio_active_source == AudioActiveSource::INTERNAL_EMBEDDED &&
+            audio_stream_idx >= 0 && swr_ctx)
             _push_audio_frames(decoded_audio_queue, swr_ctx, audio_sample_rate);
-        else if (ext_audio_stream >= 0 && ext_swr_ctx)
+        else if (audio_active_source == AudioActiveSource::EXTERNAL_STREAM &&
+                 ext_audio_stream >= 0 && ext_swr_ctx)
             _push_audio_frames(ext_audio_frame_queue, ext_swr_ctx, 0);
     }
 
@@ -1005,29 +1100,49 @@ void FFmpegPlayer::_process(double delta) {
         status_timer = 0.0; _emit_buffering_status();
     }
 
-    // ─── التحقق الذكي والمشترك من نهاية الفيديو ──────────────────────────────
-    if (duration > 0.0 && position >= duration) {
-        bool audio_buffer_empty = true;
-        
-        // إذا كنا نستخدم صوت جودو الداخلي/الخارجي عبر الـ generator والمشغل يعمل
-        if (!ext_using_godot_player && int_audio_playback.is_valid() && int_audio_generator.is_valid()) {
-            // حساب الإطارات التي تم ضخها ولا تزال تنتظر دورها في التشغيل داخل بافر جودو
-            int remaining_frames = int_audio_playback->get_frames_available(); 
-            int total_buffer_size = (int)(godot_mix_rate * int_audio_generator->get_buffer_length());
-            int buffered_frames = total_buffer_size - remaining_frames;
+    // ─── [EOF-FIX v6.2] الاكتشاف الحقيقي لنهاية الفيديو ──────────────────────
+    // بدلاً من "position >= duration" (كانت تفشل بسبب GPU_LATENCY_OFFSET
+    // السالب وتبقى عالقة عند ~1 ثانية متبقية إلى الأبد)، ننتظر الآن:
+    //   1) الديموكسر الرئيسي أعاد AVERROR_EOF فعليًا (demux_eof_reached)
+    //   2) طوابير الفيديو والصوت الداخلي فارغة تمامًا (باستثناء آخر إطار معروض)
+    //   3) إن كان هناك صوت خارجي شبكي نشط: ديموكسره أيضًا وصل EOF وطوابيره فارغة
+    //   4) بافر الصوت المسموع (AudioStreamGenerator) لم يعد يحتوي صوتًا لم يُسمع بعد
+    if (demux_eof_reached) {
+        bool video_drained = video_packet_queue.empty() &&
+                              decoded_frame_queue.size() <= 1;
 
-            // إذا كان هناك أكثر من 40ms من الصوت لم تشغل بعد، ننتظر ولا ننهي الفيديو الآن
-            if (buffered_frames > (int)(godot_mix_rate * 0.04)) {
-                audio_buffer_empty = false;
+        bool internal_audio_drained = audio_packet_queue.empty() &&
+                                       decoded_audio_queue.empty();
+
+        bool ext_audio_drained = (ext_audio_stream < 0) ||
+                                  (ext_audio_eof &&
+                                   ext_audio_pkt_queue.empty() &&
+                                   ext_audio_frame_queue.empty());
+
+        if (video_drained && internal_audio_drained && ext_audio_drained) {
+            bool audio_buffer_empty = true;
+
+            // إذا كنا نستخدم صوت جودو الداخلي/الخارجي عبر الـ generator والمشغل يعمل
+            if (!ext_using_godot_player && int_audio_playback.is_valid() && int_audio_generator.is_valid()) {
+                // حساب الإطارات التي تم ضخها ولا تزال تنتظر دورها في التشغيل داخل بافر جودو
+                int remaining_frames = int_audio_playback->get_frames_available();
+                int total_buffer_size = (int)(godot_mix_rate * int_audio_generator->get_buffer_length());
+                int buffered_frames = total_buffer_size - remaining_frames;
+
+                // إذا كان هناك أكثر من 40ms من الصوت لم تشغل بعد، ننتظر ولا ننهي الفيديو الآن
+                if (buffered_frames > (int)(godot_mix_rate * 0.04)) {
+                    audio_buffer_empty = false;
+                }
             }
-        }
 
-        if (audio_buffer_empty) {
-            if (looping) {
-                seek(0.0);
-            } else {
-                stop();
-                _emit_video_finished();
+            if (audio_buffer_empty) {
+                if (looping) {
+                    demux_eof_reached = false;
+                    seek(0.0);
+                } else {
+                    stop();
+                    _emit_video_finished();
+                }
             }
         }
     }
@@ -1068,8 +1183,12 @@ void FFmpegPlayer::_read_packets_to_queue() {
     for (int i = 0; i < batch; i++) {
         int ret = av_read_frame(fmt_ctx, pk);
         if (ret < 0) {
-            if (ret != AVERROR_EOF)
+            // [v6.2] EOF حقيقي: نُسجّله لاستخدامه في اكتشاف نهاية التشغيل
+            if (ret == AVERROR_EOF) {
+                demux_eof_reached = true;
+            } else {
                 _emit_playback_error("Read error — connection lost?");
+            }
             av_packet_unref(pk); break;
         }
         if (pk->stream_index == video_stream_idx)
@@ -1216,12 +1335,12 @@ bool FFmpegPlayer::_present_frame_at(double pos) {
     // البحث عن الإطار الأنسب للوقت الحالي وإسقاط كل ما تجاوزه الزمن بشكل تدريجي
     while (decoded_frame_queue.size() > 1) {
         double next_pts = decoded_frame_queue[1].pts;
-        
+
         // إذا كان الإطار التالي قد حان موعده
         if (next_pts <= pos) {
             decoded_frame_queue.pop_front();
             frames_dropped_this_tick++;
-            
+
             // إذا وصلنا للحد المسموح به في هذا الفريم، نخرج فوراً ونترك الباقي للفريم القادم
             if (frames_dropped_this_tick >= MAX_FRAMES_TO_DROP_PER_TICK) {
                 break;
@@ -1242,7 +1361,7 @@ bool FFmpegPlayer::_present_frame_at(double pos) {
     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, f.data);
     current_texture->update(img);
     _emit_frame_updated();
-    
+
     return true;
 }
 // ─── الملء الأولي ─────────────────────────────────────────────────────────────
@@ -1254,7 +1373,8 @@ void FFmpegPlayer::_prefill_buffers() {
         _read_packets_to_queue(); _update_buffer_stats();
     }
     _decode_packets_into_queue();
-    _decode_audio_into_queue();
+    if (audio_active_source == AudioActiveSource::INTERNAL_EMBEDDED)
+        _decode_audio_into_queue();
     if (ext_fmt_ctx) {
         for (int i = 0; i < 10; i++) _read_ext_audio_packets();
         _decode_ext_audio_into_queue();
@@ -1292,7 +1412,7 @@ void FFmpegPlayer::_clear_queues() {
 void FFmpegPlayer::_cleanup() {
     // 1. تأمين وإغلاق الخيط أولاً وقبل كل شيء لمنع تصادم الذاكرة (Race Conditions)
     if (audio_loading_thread_running) {
-        audio_loading_thread_running = false; 
+        audio_loading_thread_running = false;
         if (audio_loading_thread.joinable()) {
             audio_loading_thread.join(); // انتظر إغلاق الخيط بسلام
         }
@@ -1322,6 +1442,12 @@ void FFmpegPlayer::_cleanup() {
     loaded_audio_path = ""; ext_using_godot_player = false;
     audio_samples_pushed = 0; audio_clock_offset = 0.0; audio_clock_active = false;
     last_audio_pts = -1.0; audio_resync_needed = false;
+
+    // [v6.2] إعادة ضبط حالة EOF وأولوية مصدر الصوت
+    demux_eof_reached        = false;
+    audio_active_source      = AudioActiveSource::NONE;
+    external_audio_requested = false;
+    external_audio_ready     = false;
 }
 
 // ─── الإشارات ─────────────────────────────────────────────────────────────────
