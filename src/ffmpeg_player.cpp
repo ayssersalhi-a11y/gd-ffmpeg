@@ -2,7 +2,24 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 6.2 — إنهاء حقيقي (EOF) + أولوية صوت ذكية (خارجي إن توفر، داخلي كاحتياطي)
+ * الإصدار 6.3 — فتح الفيديو الشبكي بشكل غير متزامن (Async) + probesize/analyzeduration
+ *
+ * ─── ما الجديد في v6.3 ────────────────────────────────────────────────────────
+ *
+ * [ASYNC-VIDEO] فتح الفيديو الشبكي (avformat_open_input +
+ *           avformat_find_stream_info) كان يُنفَّذ بشكل متزامن على الخيط
+ *           الرئيسي داخل load_video()، مما يُجمّد محرك Godot بالكامل لثوانٍ
+ *           عند التشغيل من الإنترنت (يظهر كشاشة سوداء + توقف الواجهة تمامًا).
+ *           الآن يتم تنفيذ هذا الفتح في std::thread خلفي منفصل (بنفس نمط
+ *           _open_audio_async_worker المستخدم أصلاً للصوت الشبكي)، وتُسلَّم
+ *           النتيجة (نجاح/فشل) للخيط الرئيسي عبر أعلام atomic تُفحَص في
+ *           بداية _process() قبل أي شيء آخر.
+ *
+ * [PROBE-SPEED] إضافة probesize=512KB و analyzeduration=2s لفتح الفيديو
+ *           الشبكي — لم تكونا مضبوطتين هنا رغم استخدامهما فعليًا في فتح
+ *           الصوت الخارجي (_open_audio_with_ffmpeg)، مما كان يجعل تحليل
+ *           الستريم (avformat_find_stream_info) يأخذ وقتًا أطول من اللازم
+ *           باستخدام القيم الافتراضية الأكبر لـ FFmpeg.
  *
  * ─── ما الجديد في v6.2 ────────────────────────────────────────────────────────
  *
@@ -143,7 +160,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v6.2 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v6.3 ---");
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
@@ -163,6 +180,10 @@ void FFmpegPlayer::_ready() {
 }
 
 // ─── تحميل الفيديو ────────────────────────────────────────────────────────────
+// [ASYNC-VIDEO v6.3] لروابط الشبكة: الفتح الفعلي (avformat_open_input +
+// avformat_find_stream_info) يتم الآن في خيط خلفي عبر _open_video_async_worker
+// لمنع تجميد محرك Godot. النتيجة تُفحَص في بداية _process() وتُستكمل هناك عبر
+// _finalize_loaded_video(). الملفات المحلية تبقى متزامنة كما كانت (فتحها سريع).
 bool FFmpegPlayer::load_video(const String &path) {
     _cleanup();
     buffering = false; forward_buffer_secs = 0.0;
@@ -171,54 +192,119 @@ bool FFmpegPlayer::load_video(const String &path) {
 
     if (path.is_empty()) { _emit_playback_error("Path is empty"); return false; }
 
-    is_live_stream  = path.begins_with("rtmp://") || path.begins_with("rtsp://");
-    // [v6.2] لم يعد "use_external_audio" يُشتق من نوع مسار الفيديو؛ أصبح
-    // يعكس ديناميكيًا ما إذا كان مصدر صوت خارجي نشطًا فعليًا الآن (انظر
-    // _switch_to_external_local_file / معالج audio_load_finished_successfully).
-    bool video_is_network = path.begins_with("http://") || path.begins_with("https://");
-    bool is_network        = is_live_stream || video_is_network;
-
-    UtilityFunctions::print("[LOAD] Mode: ",
-        is_live_stream ? "Live Stream" : (video_is_network ? "Direct URL" : "Local File"),
-        " | Audio: internal (embedded) by default, external overrides via load_audio()");
+    bool is_live           = path.begins_with("rtmp://") || path.begins_with("rtsp://");
+    bool video_is_network  = path.begins_with("http://") || path.begins_with("https://");
+    bool is_network        = is_live || video_is_network;
 
     if (path.ends_with(".m3u") || path.contains(".m3u?")) {
         _emit_playback_error("M3U_DETECTED"); return false;
     }
 
-    String real_path = is_network ? path
-        : ProjectSettings::get_singleton()->globalize_path(path);
+    UtilityFunctions::print("[LOAD] Mode: ",
+        is_live ? "Live Stream" : (video_is_network ? "Direct URL" : "Local File"),
+        " | Audio: internal (embedded) by default, external overrides via load_audio()");
 
-    CharString utf8   = real_path.utf8();
-    AVDictionary *opts = nullptr;
-
+    // ── [ASYNC-VIDEO v6.3] الشبكة: فتح غير متزامن في خيط خلفي ────────────────
+    // لا يُجمَّد المحرك؛ النتيجة (نجاح/فشل) تصل عبر إشارة video_loaded من
+    // داخل _process() بمجرد اكتمال العملية في الخيط الخلفي.
     if (is_network) {
-        av_dict_set(&opts, "user_agent",
-            "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36", 0);
-        av_dict_set(&opts, "tls_verify",          "0", 0);
-        av_dict_set(&opts, "protocol_whitelist",
-            "file,http,https,tcp,tls,crypto,hls,applehttp,rtmp,rtsp,data,redirect", 0);
-        av_dict_set(&opts, "fflags",              "nobuffer", 0);
-        av_dict_set(&opts, "flags",               "low_delay", 0);
-        av_dict_set(&opts, "reconnect",           "1", 0);
-        av_dict_set(&opts, "reconnect_delay_max", "5", 0);
-        // [12] لا reconnect_streamed للملفات المباشرة
-        if (is_live_stream) av_dict_set(&opts, "reconnect_streamed", "1", 0);
+        // تأمين: إن كان هناك خيط سابق ما زال يعمل (نادر، لكن للاحتياط) ننتظره
+        if (video_loading_thread_running) {
+            if (video_loading_thread.joinable()) video_loading_thread.join();
+        }
+        video_load_ready             = false;
+        video_load_error             = false;
+        pending_video_error_message  = "";
+        pending_video_path           = path;
+        pending_video_is_live        = is_live;
+        video_loading_thread_running = true;
+        video_loading_thread = std::thread(&FFmpegPlayer::_open_video_async_worker,
+                                            this, path, is_live);
+        UtilityFunctions::print("[LOAD] Opening network video asynchronously...");
+        return true; // النتيجة الفعلية تصل لاحقًا عبر إشارة video_loaded
     }
 
-    if (avformat_open_input(&fmt_ctx, utf8.get_data(), nullptr, &opts) < 0) {
-        av_dict_free(&opts);
+    // ── ملف محلي: يبقى متزامنًا (الفتح المحلي سريع، لا حاجة لخيط) ────────────
+    String real_path = ProjectSettings::get_singleton()->globalize_path(path);
+    CharString utf8   = real_path.utf8();
+    AVFormatContext *local_ctx = nullptr;
+
+    if (avformat_open_input(&local_ctx, utf8.get_data(), nullptr, nullptr) < 0) {
         _emit_playback_error("Cannot open: " + path);
         _emit_video_loaded(false); return false;
     }
-    av_dict_free(&opts);
 
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        _cleanup();
+    if (avformat_find_stream_info(local_ctx, nullptr) < 0) {
+        avformat_close_input(&local_ctx);
         _emit_playback_error("Cannot read stream info: " + path);
         return false;
     }
+
+    return _finalize_loaded_video(local_ctx, false);
+}
+
+// ─── [ASYNC-VIDEO v6.3] فتح الفيديو الشبكي في خيط خلفي ──────────────────────
+// تحذير: هذه الدالة تُنفَّذ على خيط منفصل تمامًا عن الخيط الرئيسي — يُمنع
+// استدعاء أي دالة من Godot (Node/Signal/Texture/...) من داخلها. فقط عمليات
+// FFmpeg الخام مسموحة هنا. النتيجة تُسلَّم للخيط الرئيسي عبر
+// pending_video_fmt_ctx + الأعلام الذرية (atomic) ليقرأها _process().
+void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
+    AVFormatContext *ctx = nullptr;
+    AVDictionary   *opts = nullptr;
+    CharString      utf8 = path.utf8();
+
+    av_dict_set(&opts, "user_agent",
+        "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36", 0);
+    av_dict_set(&opts, "tls_verify",          "0", 0);
+    av_dict_set(&opts, "protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,hls,applehttp,rtmp,rtsp,data,redirect", 0);
+    av_dict_set(&opts, "fflags",              "nobuffer", 0);
+    av_dict_set(&opts, "flags",               "low_delay", 0);
+    av_dict_set(&opts, "reconnect",           "1", 0);
+    av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+    // [12] لا reconnect_streamed للملفات المباشرة (غير البث الحي)
+    if (is_live) av_dict_set(&opts, "reconnect_streamed", "1", 0);
+
+    // ── [PROBE-SPEED v6.3] نفس تحسينات تسريع الفتح المستخدمة في الصوت ────────
+    // (كانت مفقودة هنا سابقًا رغم وجودها في _open_audio_with_ffmpeg، مما كان
+    // يجعل avformat_find_stream_info يستخدم القيم الافتراضية الأبطأ لـ FFmpeg)
+    av_dict_set(&opts, "probesize",       "524288",  0); // 512 KB بدلاً من ~5MB
+    av_dict_set(&opts, "analyzeduration", "2000000", 0); // 2 ثانية بدلاً من ~5s
+
+    int ret = avformat_open_input(&ctx, utf8.get_data(), nullptr, &opts);
+    av_dict_free(&opts);
+
+    if (ret < 0) {
+        char err_buf[256];
+        av_strerror(ret, err_buf, sizeof(err_buf));
+        pending_video_error_message = "Cannot open: " + path + " (" + String(err_buf) + ")";
+        video_load_error = true;
+        video_loading_thread_running = false;
+        return;
+    }
+
+    if (avformat_find_stream_info(ctx, nullptr) < 0) {
+        avformat_close_input(&ctx);
+        pending_video_error_message = "Cannot read stream info: " + path;
+        video_load_error = true;
+        video_loading_thread_running = false;
+        return;
+    }
+
+    // تسليم النتيجة للخيط الرئيسي — لا شيء آخر من Godot يُلمَس هنا
+    pending_video_fmt_ctx        = ctx;
+    video_load_ready             = true;
+    video_loading_thread_running = false;
+}
+
+// ─── [ASYNC-VIDEO v6.3] إتمام تحميل الفيديو بعد نجاح الفتح ─────────────────
+// يُستدعى حصريًا من الخيط الرئيسي (من load_video() للملفات المحلية، أو من
+// _process() بعد التقاط نتيجة الخيط الخلفي للفيديو الشبكي). يحتوي كل المنطق
+// الذي كان سابقًا داخل load_video() بعد نجاح avformat_open_input.
+bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_live) {
+    fmt_ctx        = opened_ctx;
+    is_live_stream = is_live;
 
     stream_start_time = (fmt_ctx->start_time != AV_NOPTS_VALUE)
                         ? (double)fmt_ctx->start_time / AV_TIME_BASE : 0.0;
@@ -226,16 +312,17 @@ bool FFmpegPlayer::load_video(const String &path) {
     video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (video_stream_idx < 0) {
         _cleanup();
-        _emit_playback_error("No video stream: " + path);
-        _emit_video_loaded(false); return false;
+        _emit_playback_error("No video stream");
+        _emit_video_loaded(false);
+        return false;
     }
     if (!_setup_video_codec(fmt_ctx->streams[video_stream_idx])) {
-        _cleanup(); _emit_video_loaded(false); return false;
+        _cleanup();
+        _emit_video_loaded(false);
+        return false;
     }
 
     // ── [AUDIO-FALLBACK v6.2] الصوت الداخلي المدمج دائمًا هو الخيار الافتراضي ──
-    // يُعدّ دائمًا بغض النظر عن كون الفيديو محليًا أو رابط شبكة، لأنه سيُستخدم
-    // فورًا ما لم يُطلب صوت خارجي عبر load_audio() لاحقًا وينجح تحميله.
     audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (audio_stream_idx >= 0) {
         AVCodecContext *ac = nullptr; SwrContext *sw = nullptr;
@@ -875,8 +962,17 @@ void FFmpegPlayer::_push_audio_frames(
 
 
 // ─── play ─────────────────────────────────────────────────────────────────────
+// [ASYNC-VIDEO v6.3] fmt_ctx قد يكون nullptr مؤقتًا أثناء انتظار اكتمال فتح
+// فيديو شبكي في الخيط الخلفي؛ في هذه الحالة نؤجل التشغيل الفعلي عبر
+// pending_autoplay ويُنفَّذ تلقائيًا من _process() بمجرد نجاح التحميل.
 void FFmpegPlayer::play() {
-    if (!fmt_ctx) { _emit_playback_error("No video loaded"); return; }
+    if (!fmt_ctx) {
+        if (video_loading_thread_running || video_load_ready) {
+            pending_autoplay = true;
+            return;
+        }
+        _emit_playback_error("No video loaded"); return;
+    }
     playing = true; buffering = true; frame_timer = 0.0;
     _reset_audio_clock(position);
     _reset_last_audio_pts();
@@ -977,6 +1073,30 @@ void FFmpegPlayer::seek(double seconds) {
 // ─── _process ─────────────────────────────────────────────────────────────────
 // ─── _process ─────────────────────────────────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
+    // ── [ASYNC-VIDEO v6.3] التقاط نتيجة فتح الفيديو الشبكي من الخيط الخلفي ──
+    // يجب أن يحدث هذا القسم قبل أي early-return (بما فيها "if (!fmt_ctx...)")
+    // لأن fmt_ctx يبقى nullptr طوال فترة انتظار اكتمال الخيط الخلفي.
+    if (video_load_ready) {
+        video_load_ready = false;
+        AVFormatContext *ctx = pending_video_fmt_ctx;
+        pending_video_fmt_ctx = nullptr;
+        bool is_live = pending_video_is_live;
+
+        bool ok = _finalize_loaded_video(ctx, is_live);
+        if (ok && pending_autoplay) {
+            pending_autoplay = false;
+            play();
+        } else if (!ok) {
+            pending_autoplay = false;
+        }
+    }
+    if (video_load_error) {
+        video_load_error = false;
+        pending_autoplay = false;
+        _emit_playback_error(pending_video_error_message);
+        _emit_video_loaded(false);
+    }
+
     if (!fmt_ctx || !playing) return;
 
     // التحقق الآمن من نجاح تحميل الصوت الشبكي في الخيط الرئيسي
@@ -1410,13 +1530,30 @@ void FFmpegPlayer::_clear_queues() {
 // ─── التنظيف الكامل ───────────────────────────────────────────────────────────
 // ─── التنظيف الكامل ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup() {
-    // 1. تأمين وإغلاق الخيط أولاً وقبل كل شيء لمنع تصادم الذاكرة (Race Conditions)
+    // 1. تأمين وإغلاق خيط الصوت الشبكي أولاً وقبل كل شيء لمنع تصادم الذاكرة
     if (audio_loading_thread_running) {
         audio_loading_thread_running = false;
         if (audio_loading_thread.joinable()) {
             audio_loading_thread.join(); // انتظر إغلاق الخيط بسلام
         }
     }
+
+    // [ASYNC-VIDEO v6.3] تأمين وإغلاق خيط فتح الفيديو الشبكي بنفس الطريقة،
+    // ومنع تسرّب الذاكرة إن كان قد نجح الفتح لكن لم يُعالَج بعد في _process()
+    if (video_loading_thread_running) {
+        video_loading_thread_running = false;
+        if (video_loading_thread.joinable()) {
+            video_loading_thread.join();
+        }
+    }
+    if (video_load_ready && pending_video_fmt_ctx) {
+        avformat_close_input(&pending_video_fmt_ctx);
+    }
+    video_load_ready      = false;
+    video_load_error      = false;
+    pending_autoplay       = false;
+    pending_video_fmt_ctx  = nullptr;
+    pending_video_error_message = "";
 
     _clear_queues();
     _cleanup_ext_audio();
