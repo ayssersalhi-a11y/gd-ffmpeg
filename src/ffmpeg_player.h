@@ -2,7 +2,20 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار 6.2 — إنهاء حقيقي (EOF) + أولوية صوت ذكية (خارجي إن توفر، داخلي كاحتياطي)
+ * الإصدار 6.3 — إضافة: فتح الفيديو الشبكي بشكل غير متزامن (Async) + probesize/analyzeduration
+ *
+ * ─── الجديد في v6.3 ──────────────────────────────────────────────────────────
+ *
+ *  [ASYNC-VIDEO] فتح الفيديو الشبكي في خيط خلفي:
+ *        avformat_open_input()/avformat_find_stream_info() لروابط الشبكة كانا
+ *        يُنفَّذان بشكل متزامن على الخيط الرئيسي في load_video()، مما يُجمّد
+ *        محرك Godot بالكامل لثوانٍ (تظهر كشاشة سوداء + توقف الواجهة). الآن يتم
+ *        تنفيذهما في std::thread منفصل تمامًا كما هو الحال مع الصوت الشبكي،
+ *        وتُسلَّم النتيجة إلى الخيط الرئيسي عبر أعلام atomic تُفحَص في _process().
+ *
+ *  [PROBE-SPEED] إضافة probesize=512KB و analyzeduration=2s لفتح الفيديو
+ *        الشبكي (لم تكونا موجودتين سابقًا هنا رغم وجودهما في فتح الصوت
+ *        الخارجي)، لتسريع avformat_find_stream_info() على الروابط الشبكية.
  *
  * ─── الجديد في v6.2 ──────────────────────────────────────────────────────────
  *
@@ -186,6 +199,22 @@ private:
     std::atomic<bool> audio_loading_thread_running{false};
     std::atomic<bool> audio_load_finished_successfully{false};
 
+    // ── [ASYNC-VIDEO v6.3] خيط فتح الفيديو الشبكي (يمنع تجميد المحرك) ───────
+    // avformat_open_input()/avformat_find_stream_info() على روابط الشبكة قد
+    // تستغرقان ثوانٍ؛ تنفيذهما هنا في خيط خلفي منفصل تمامًا عن الخيط الرئيسي.
+    // لا يُلمَس أي كائن Godot (Node/Texture/Signal) من داخل هذا الخيط إطلاقًا؛
+    // فقط AVFormatContext* خام وأعلام atomic تُسلَّم للخيط الرئيسي ليقرأها
+    // ويكمل العمل (register signals, allocate buffers...) في _process().
+    std::thread        video_loading_thread;
+    std::atomic<bool>  video_loading_thread_running{false};
+    std::atomic<bool>  video_load_ready{false};   // نجح الفتح، بانتظار المعالجة في _process
+    std::atomic<bool>  video_load_error{false};   // فشل الفتح
+    AVFormatContext   *pending_video_fmt_ctx = nullptr;
+    String             pending_video_error_message;
+    String             pending_video_path;
+    bool               pending_video_is_live = false;
+    bool               pending_autoplay      = false; // play() استُدعيت قبل اكتمال الفتح الشبكي
+
     static const int MAX_DECODED_FRAMES = 8;
     static const int MAX_AUDIO_FRAMES   = 32;
 
@@ -272,6 +301,10 @@ private:
     bool _open_audio_with_ffmpeg(const String &path);
     void _open_audio_async_worker(String path);
     void _cleanup_ext_audio();
+
+    // [ASYNC-VIDEO v6.3] فتح الفيديو الشبكي في خيط خلفي + إتمام التحميل
+    void _open_video_async_worker(String path, bool is_live);
+    bool _finalize_loaded_video(AVFormatContext *opened_ctx, bool is_live);
 
     void _read_packets_to_queue();
     void _read_ext_audio_packets();
