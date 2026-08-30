@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  GitHub Actions — بناء libgdffmpeg.so (OpenSSL + FFmpeg)                 ║
-# ║  v4.1 — إصلاح -fPIC لبناء Linux                                          ║
+# ║  v6 — بنية addons/gdffmpeg صحيحة + إزالة الضغط المزدوج (Double-Zip)      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 name: Build libgdffmpeg.so (OpenSSL + FFmpeg)
@@ -129,9 +129,17 @@ jobs:
 
       - name: Verify OpenSSL output
         run: |
-          echo "── ملفات OpenSSL ──"
-          ls -lh openssl_build/lib/ || true
-          ls openssl_build/include/openssl/ | head -10 || true
+          # [إصلاح] كان هذا يفحص المسار المسطّح "openssl_build/lib" الذي لا
+          # يوجد أبدًا فعليًا (المخرجات دائمًا تحت مجلد فرعي حسب المنصة/المعمارية
+          # مثل openssl_build/android-arm64/lib) — فكانت هذه الخطوة صامتة تمامًا
+          # لا تتحقق من شيء (`|| true` يُخفي الفشل الدائم). الآن تحسب المسار الصحيح.
+          OPENSSL_SUBDIR="android-arm64"
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            OPENSSL_SUBDIR="linux-${{ matrix.arch }}"
+          fi
+          echo "── ملفات OpenSSL (${OPENSSL_SUBDIR}) ──"
+          ls -lh "openssl_build/${OPENSSL_SUBDIR}/lib/" || true
+          ls "openssl_build/${OPENSSL_SUBDIR}/include/openssl/" | head -10 || true
 
       # ── 7. كاش FFmpeg ────────────────────────────────────────────────────────
       - name: Cache FFmpeg
@@ -139,8 +147,11 @@ jobs:
         id: cache-ffmpeg
         with:
           path: ffmpeg_build
-          # [v4] رُفع الرقم — FFmpeg يُعاد بناؤه مع --enable-pic لإصلاح Assembly PIC
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ matrix.platform }}-${{ matrix.arch }}-v4
+          # [v5] رُفع الرقم — تغيّرت فعليًا خيارات بناء FFmpeg: تفعيل rtmp/rtsp،
+          # ديكودرز MediaCodec الصريحة، flv/rtsp demuxer، vorbis، وفصل مسار
+          # مخرجات Linux حسب المعمارية. دون رفع الرقم، سيستمر CI باستخدام
+          # الكاش القديم متجاهلاً كل هذه الإصلاحات.
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ matrix.platform }}-${{ matrix.arch }}-v5
 
       # ── 8. بناء FFmpeg (إذا لم يوجد في الكاش) ────────────────────────────────
       - name: Build FFmpeg + OpenSSL for ${{ matrix.platform }} (${{ matrix.arch }})
@@ -193,10 +204,11 @@ jobs:
               -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI=arm64-v8a \
               -DANDROID_PLATFORM=android-${{ env.ANDROID_API }} \
+              -DANDROID_STL=c++_static \
               -DCMAKE_BUILD_TYPE=Release \
               -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
               -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
-              -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
+              -DOPENSSL_BASE_DIR="${{ github.workspace }}/openssl_build"
           elif [ "${{ matrix.platform }}" = "linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
             cmake -S . -B _cmake_build/${{ matrix.arch }} \
               -G Ninja \
@@ -207,29 +219,30 @@ jobs:
               -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
               -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
               -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
-              -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
+              -DOPENSSL_BASE_DIR="${{ github.workspace }}/openssl_build"
           else
             cmake -S . -B _cmake_build/${{ matrix.arch }} \
               -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
               -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
               -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg_build" \
-              -DOPENSSL_DIR="${{ github.workspace }}/openssl_build"
+              -DOPENSSL_BASE_DIR="${{ github.workspace }}/openssl_build"
           fi
           cmake --build _cmake_build/${{ matrix.arch }} --parallel $(nproc)
 
       # ── 11. جمع الملفات في مجلد واحد (Deployment Ready) ─────────────────────
       - name: Collect output files
         run: |
-          # إنشاء مجلد توزيع موحد
-          mkdir -p dist/bin
-          
-          # نسخ ملفات المكتبة المشتركة (.so) من مسارات البناء المختلفة إلى المجلد الموحد
-          # هذا الأمر سيبحث في _cmake_build عن أي ملف .so وينسخه لـ dist/bin
-          find _cmake_build -name "*.so" -exec cp {} dist/bin/ \;
-          
-          # نسخ ملف الـ gdextension إلى المجلد الرئيسي للتوزيع
-          cp gdffmpeg.gdextension dist/
+          # [إصلاح البنية] بنية addons/gdffmpeg/bin مطابقة تمامًا لما يتوقعه
+          # gdffmpeg.gdextension داخليًا (res://addons/gdffmpeg/bin/...) —
+          # بدل بنية مسطّحة (bin/ فقط) كانت تتطلب إعادة ترتيب يدوي من المستخدم.
+          mkdir -p dist/addons/gdffmpeg/bin
+
+          # نسخ ملفات المكتبة المشتركة (.so) من مسارات البناء المختلفة
+          find _cmake_build -name "*.so" -exec cp {} dist/addons/gdffmpeg/bin/ \;
+
+          # نسخ ملف الـ gdextension داخل مجلد الإضافة نفسه (وليس بجانبه)
+          cp gdffmpeg.gdextension dist/addons/gdffmpeg/
 
           echo "══ محتويات مجلد التوزيع النهائي (dist) ══"
           ls -R dist/
@@ -253,8 +266,8 @@ jobs:
             echo ""
             echo "| الملف | الحجم |"
             echo "|-------|-------|"
-            # التصحيح هنا: البحث في المسار الصحيح الذي وضعنا فيه الملفات (dist/bin)
-            for f in dist/bin/*; do
+            # [تصحيح المسار] يطابق البنية الجديدة addons/gdffmpeg/bin
+            for f in dist/addons/gdffmpeg/bin/*; do
               [ -f "$f" ] && echo "| \`$(basename $f)\` | $(du -h $f | cut -f1) |"
             done
           } >> $GITHUB_STEP_SUMMARY
@@ -272,33 +285,34 @@ jobs:
         with:
           path: all_artifacts
 
-      # ── 3. ترتيب الملفات وضغطها ──────────────────────────────────────────
-      - name: Organize and create ZIP
+      # ── 3. ترتيب الملفات في بنية addons/gdffmpeg الصحيحة ─────────────────
+      - name: Organize into addon structure
         run: |
-          # إنشاء هيكل المجلدات المطلوب (مجلد dist يحتوي على bin وملف الـ gdextension)
-          mkdir -p dist/bin
-          
-          # استخراج جميع ملفات الـ .so من المجلدات الفرعية ووضعها داخل dist/bin
-          find all_artifacts -name "*.so" -exec cp {} dist/bin/ \;
-          
-          # نسخ ملف الـ gdextension بجانب مجلد bin
-          cp gdffmpeg.gdextension dist/
-          
-          # طباعة محتويات مجلد التوزيع للتأكد من الشكل النهائي
-          echo "══ محتويات المجلد النهائي قبل الضغط ══"
-          ls -R dist/
-          
-          # ضغط محتويات مجلد dist بالكامل داخل ملف ZIP واحد
-          cd dist
-          zip -r ../gdffmpeg-complete-plugin.zip *
-          cd ..
-          
-          echo "✅ تم إنشاء ملف الضغط بنجاح!"
+          # [إصلاح الاسم والمسار] بنية addons/gdffmpeg/bin مطابقة تمامًا لِما
+          # يتوقعه gdffmpeg.gdextension داخليًا (res://addons/gdffmpeg/bin/...).
+          # لا نُنشئ ملف ZIP يدويًا هنا إطلاقًا — GitHub Actions يُغلّف أي
+          # Artifact بضغطة تحميل واحدة تلقائيًا بنفسه؛ لو ضغطنا نحن أيضًا
+          # يدويًا، يحصل المستخدم على ZIP بداخله ZIP آخر (ضغط مزدوج) عليه
+          # فك الضغط مرتين قبل الوصول لأي ملف فعلي — وهذا ما كان يحدث سابقًا.
+          mkdir -p dist/addons/gdffmpeg/bin
 
-      # ── 4. رفع ملف الـ ZIP النهائي وجعله قابلاً للتحميل ──────────────────
-      - name: Upload Final ZIP Artifact
+          # استخراج جميع ملفات الـ .so من مخرجات كل منصة ووضعها في bin/
+          find all_artifacts -name "*.so" -exec cp {} dist/addons/gdffmpeg/bin/ \;
+
+          # نسخ ملف الـ gdextension داخل مجلد الإضافة نفسه
+          cp gdffmpeg.gdextension dist/addons/gdffmpeg/
+
+          echo "══ محتويات مجلد التوزيع النهائي (سيظهر بهذا الشكل بعد فك ضغط واحد) ══"
+          ls -R dist/
+
+      # ── 4. رفع مجلد الإضافة مباشرة (وليس ملف ZIP) ─────────────────────────
+      # النتيجة: يحمّل المستخدم ملف gdffmpeg-plugin-vNNN.zip (تغليف GitHub
+      # التلقائي الوحيد)، وعند فك الضغط مرة واحدة فقط يجد مجلد "addons/"
+      # جاهزًا للسحب مباشرة إلى جذر مشروع Godot الخاص به.
+      - name: Upload Final Addon Artifact
         uses: actions/upload-artifact@v4
         with:
           name: gdffmpeg-plugin-v${{ github.run_number }}
-          path: gdffmpeg-complete-plugin.zip
+          path: dist
           retention-days: 30
+          if-no-files-found: error
