@@ -2,7 +2,61 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار 6.3 — إضافة: فتح الفيديو الشبكي بشكل غير متزامن (Async) + probesize/analyzeduration
+ * الإصدار 7.0 — قراءة شبكية بخيوط مستقلة تمامًا (لا تجمّد إطلاقًا) + مهلات زمنية
+ *
+ * ─── الجديد في v7.0 ──────────────────────────────────────────────────────────
+ *
+ *  [THREAD-SAFE-NETWORK] القراءة المستمرة من الشبكة (av_read_frame) والـ Seek
+ *        (av_seek_frame) كانا يُنفَّذان على الخيط الرئيسي لكل من fmt_ctx
+ *        (الفيديو) و ext_fmt_ctx (الصوت الخارجي الشبكي). إن تجمّد الاتصال
+ *        (Socket مفتوح لكن بلا بيانات ولا خطأ) كان هذا يُجمّد محرك Godot
+ *        بالكامل لمدة غير محدودة. الآن أصبح لكل منهما خيط خلفي مستقل تمامًا
+ *        (_network_read_worker / _ext_network_read_worker) يملك سياقه حصريًا؛
+ *        الخيط الرئيسي لا يستدعي أي دالة av_* عليهما إطلاقًا — فقط يقرأ من
+ *        طوابير محمية بـ std::mutex يملؤها هذان الخيطان. عمليات الـ Seek على
+ *        مصدر شبكي أصبحت طلبات ذرية (atomic) غير حاجبة يعالجها كل خيط بنفسه.
+ *
+ *  [TIMEOUT] أُضيف timeout/rw_timeout (15 ثانية) لفتح الفيديو الشبكي (كان
+ *        موجودًا مسبقًا فقط لفتح الصوت الخارجي)، فيحدّ أقصى مدة انتظار لأي
+ *        استدعاء قراءة منفرد حتى داخل الخيط الخلفي نفسه — يضمن ألا يُحتجَز
+ *        أي خيط إلى الأبد على اتصال ميت تمامًا بلا خطأ صريح.
+ *
+ *  [محدودية معروفة — TODO مستقبلًا] عند إغلاق الخيوط الخلفية في _cleanup()
+ *        (تبديل فيديو جديد أو إغلاق التطبيق)، ننتظرها بـ join() قبل تحرير
+ *        fmt_ctx/ext_fmt_ctx. هذا الانتظار محدود بـ 15s كحد أقصى (بفضل
+ *        TIMEOUT أعلاه)، لكنه قد يُحسّ به فقط إن حدث التبديل/الإغلاق بالضبط
+ *        أثناء انقطاع شبكي كامل — وليس أثناء التشغيل العادي إطلاقًا. الحل
+ *        الجذري لإزالته نهائيًا هو نمط "Detach + تنظيف ذاتي": يُمرَّر
+ *        fmt_ctx كمتغيّر محلي لكل خيط (بدل الاعتماد على عضو الكائن)، ويُغلقه
+ *        الخيط نفسه ويخرج بمفرده دون أن ينتظره الخيط الرئيسي، مع رقم جيل
+ *        (generation counter) يُميّز حزم الجلسة القديمة عن الجديدة كي لا
+ *        تتسرب حزم من خيط يتيم متأخر إلى طوابير جلسة تحميل جديدة بدأت
+ *        بالفعل. أُجِّل هذا لتفادي التعقيد الإضافي ومخاطر تلوّث الطوابير بين
+ *        الجلسات دون داعٍ ملحّ حاليًا.
+ *
+ * ─── الجديد في v6.5 ──────────────────────────────────────────────────────────
+ *
+ *  [AV-SYNC] مراقبة دورية (كل ثانية) لموضع الصوت الخارجي المحلي الحقيقي
+ *        (AudioStreamPlayer::get_playback_position()) مقابل موضع الفيديو،
+ *        مع تصحيح صامت للفروق الصغيرة وإصدار إشارة av_sync_issue للفروق
+ *        الكبيرة الملحوظة. غير مطلوب للصوت المدمج/الشبكي لأن موضع الفيديو
+ *        هناك مُشتَق حرفيًا من ساعة الصوت (لا انجراف ممكن أصلاً).
+ *
+ * ─── الجديد في v6.4 ──────────────────────────────────────────────────────────
+ *
+ *  [BUFFER-FIX] شرط الخروج من buffering كان: "forward_buffer_secs >= INITIAL_PLAY
+ *        || !decoded_frame_queue.empty()". بما أن أول إطار يُفكّ خلال أول Tick
+ *        تقريبًا، كان الشرط الثاني (OR) يُخرِج من التخزين فورًا بغض النظر عن
+ *        حجم البيانات الفعلي المُخزَّن — فلا ينتظر أبدًا 5 ثوانٍ كاملة على شبكة
+ *        ضعيفة، مما يسبب انطلاقًا فوريًا بجزء من الثانية ثم نضوبًا سريعًا وتكرار
+ *        التقطّع. الآن الشرط يعتمد فقط على forward_buffer_secs (أو نفاد المصدر
+ *        كليًا عبر EOF)، ويُستخدم هدف أقصر (REBUFFER_TARGET=2s) لإعادة التخزين
+ *        بعد أول انطلاق ناجح (first_buffer_done) بدل إعادة انتظار 5s في كل مرة.
+ *
+ *  [STATUS-FIX] إشارة buffering_status (المغذّية لشريط التحميل في الواجهة)
+ *        كانت لا تُطلَق إطلاقًا أثناء buffering=true بسبب "return" مبكر في
+ *        _process() قبل الوصول لكود الإشارة. الآن تُطلَق دائمًا (أثناء التخزين
+ *        وأثناء التشغيل العادي) فيعكس الشريط التقدّم الحقيقي أمام المستخدم.
  *
  * ─── الجديد في v6.3 ──────────────────────────────────────────────────────────
  *
@@ -90,6 +144,7 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -182,12 +237,16 @@ private:
     AVCodecContext  *ext_audio_ctx    = nullptr;
     SwrContext      *ext_swr_ctx      = nullptr;
     int              ext_audio_stream = -1;
-    bool             ext_audio_eof    = false;
+    std::atomic<bool> ext_audio_eof{false};
 
     // ── [C] طوابير الحزم الخام ───────────────────────────────────────────────
+    // [THREAD-SAFE v7.0] هذه الطوابير أصبحت مشتركة بين الخيط الرئيسي (فك
+    // التشفير) والخيوط الخلفية للقراءة الشبكية (الدفع) — محمية بالأقفال أدناه.
     std::list<AVPacket*>  video_packet_queue;
     std::list<AVPacket*>  audio_packet_queue;
     std::deque<AVPacket*> ext_audio_pkt_queue;
+    std::mutex network_queue_mutex;     // يحمي video_packet_queue + audio_packet_queue
+    std::mutex ext_network_queue_mutex; // يحمي ext_audio_pkt_queue
 
     // ── [D] طوابير الإطارات المُفكَّكة ──────────────────────────────────────
     std::deque<DecodedFrame> decoded_frame_queue;
@@ -215,6 +274,36 @@ private:
     bool               pending_video_is_live = false;
     bool               pending_autoplay      = false; // play() استُدعيت قبل اكتمال الفتح الشبكي
 
+    // ── [THREAD-SAFE v7.0] قراءة الفيديو الشبكي المستمرة في خيط مستقل ────────
+    // بعد نجاح الفتح، يصبح هذا الخيط المالك الحصري لـ fmt_ctx: لا يستدعي
+    // الخيط الرئيسي أي av_read_frame/av_seek_frame عليه إطلاقًا بعد ذلك.
+    // هذا يضمن عدم تجمّد الواجهة إطلاقًا مهما ساءت الشبكة أو حتى لو تجمّد
+    // الاتصال بالكامل بدون خطأ صريح (timeout/rw_timeout يحدّان أيضًا أقصى
+    // مدة انتظار لأي استدعاء منفرد داخل هذا الخيط نفسه).
+    std::thread        network_read_thread;
+    std::atomic<bool>  network_reader_active{false};
+    bool               video_is_network_source = false; // يُضبط في load_video()
+
+    std::atomic<bool>   network_seek_requested{false};
+    std::atomic<double> network_seek_target_secs{0.0};
+    std::atomic<bool>   network_seek_done{false};
+    std::atomic<bool>   network_seek_failed{false};
+    bool                pending_video_seek_active   = false; // ننتظر network_seek_done في _process()
+    double              pending_video_seek_target   = 0.0;
+    bool                pending_autoplay_after_seek = false;
+
+    std::atomic<bool> network_read_error_flag{false};
+    double            network_error_notify_timer = 0.0;
+    static constexpr double NETWORK_ERROR_NOTIFY_INTERVAL = 5.0; // لا نُكرر التحذير أكثر من مرة كل 5 ثوانٍ
+    static const int  NETWORK_READ_QUEUE_CAP_PACKETS = 600; // سقف أمان لمنع نمو ذاكرة غير محدود
+
+    // ── [THREAD-SAFE v7.0] نفس الفلسفة، لكن للصوت الخارجي الشبكي (ext_fmt_ctx) ──
+    std::thread        ext_network_read_thread;
+    std::atomic<bool>  ext_network_reader_active{false};
+    std::atomic<bool>   ext_network_seek_requested{false};
+    std::atomic<double> ext_network_seek_target_secs{0.0};
+    std::atomic<bool>  ext_network_read_error_flag{false};
+
     static const int MAX_DECODED_FRAMES = 8;
     static const int MAX_AUDIO_FRAMES   = 32;
 
@@ -234,6 +323,13 @@ private:
     const double MAX_FORWARD   = 40.0;
     const double MIN_FORWARD   = 20.0;
     const double INITIAL_PLAY  = 5.0;
+
+    // ── [BUFFER-FIX v6.4] هدف تخزين أقصر لإعادة التخزين بعد نضوب ─────────────
+    // عند أول تشغيل نطلب INITIAL_PLAY (5s) كاملة. لكن كل عملية إعادة تخزين
+    // لاحقة (بعد Underrun) تكتفي بـ REBUFFER_TARGET (2s) الأقصر لتفادي انتظار
+    // طويل متكرر في كل مرة ينقطع فيها الاتصال لحظيًا.
+    const double REBUFFER_TARGET = 2.0;
+    bool first_buffer_done = false; // true بعد أول تخزين ابتدائي ناجح
 
     // ── [G] ساعة الصوت ───────────────────────────────────────────────────────
     int     godot_mix_rate       = 44100;
@@ -275,10 +371,20 @@ private:
     static constexpr double HARD_DROP_THRESHOLD = 0.020;
     static constexpr double GPU_LATENCY_OFFSET  = -0.020;
 
+    // ── [AV-SYNC v6.5] كشف/تصحيح انجراف الصوت الخارجي المحلي عن الفيديو ─────
+    // يُطبَّق فقط عندما audio_active_source == EXTERNAL_LOCAL_FILE (ext_using_
+    // godot_player) لأنه المسار الوحيد الذي لا يملك ساعة صوت داخلية دقيقة —
+    // position يتقدّم بالزمن الفعلي (delta) بدل الاعتماد على عينات مضخوخة
+    // فعليًا. الصوت المدمج والشبكي مُتزامنان بالتعريف (position = audio_clk).
+    double av_sync_check_timer = 0.0;
+    static constexpr double AV_SYNC_CHECK_INTERVAL   = 1.0;  // فحص كل ثانية
+    static constexpr double AV_SYNC_RESYNC_THRESHOLD = 0.15; // فرق مقبول → تصحيح صامت
+    static constexpr double AV_SYNC_WARNING_THRESHOLD= 0.75; // فرق ملحوظ → تحذير + تصحيح
+
     // ── [L] الإنهاء الحقيقي (EOF من الديموكسر، v6.2) ────────────────────────
     // true فقط عندما يُعيد av_read_frame على fmt_ctx الرئيسي القيمة AVERROR_EOF
     // فعليًا (نفاد البيانات من المصدر)، لا عند وصول position إلى duration.
-    bool demux_eof_reached = false;
+    std::atomic<bool> demux_eof_reached{false};
 
     // ── [M] أولوية مصدر الصوت (v6.2) ─────────────────────────────────────────
     enum class AudioActiveSource {
@@ -306,9 +412,14 @@ private:
     void _open_video_async_worker(String path, bool is_live);
     bool _finalize_loaded_video(AVFormatContext *opened_ctx, bool is_live);
 
+    // [THREAD-SAFE v7.0] خيوط القراءة المستمرة الشبكية (فيديو + صوت خارجي)
+    void _network_read_worker();
+    void _ext_network_read_worker();
+    void _trim_old_packets();
+
     void _read_packets_to_queue();
     void _read_ext_audio_packets();
-    void _prefill_buffers();
+    void _prefill_buffers(double target_secs); // [BUFFER-FIX v6.4] هدف قابل للتغيير
     void _update_buffer_stats();
     int  _calc_read_batch_size() const;
 
@@ -326,6 +437,9 @@ private:
     // [7] التعافي التلقائي
     void _handle_audio_gap(double gap_secs);
     void _reset_last_audio_pts();
+
+    // [AV-SYNC v6.5] كشف وتصحيح انجراف الصوت الخارجي المحلي عن الفيديو
+    void _check_av_sync(double delta);
 
     void _apply_audio_volume();
     void _start_audio_at(double pos);
