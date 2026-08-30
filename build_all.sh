@@ -10,6 +10,15 @@ set -e
 # 1. تحديد مسار السكريبت أولاً (ليعرف السكربت أين هو)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ─── ألوان الطرفية ────────────────────────────────────────────────────────────
+# [FIX-10] نُقلت لأعلى الملف — كانت مُعرَّفة بعد استخدامها في كتلة CLEAN=1
+# أدناه، فكانت رسائل التنظيف تظهر دائمًا بلا ألوان (متغيّرات فارغة وقتها).
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # بدون لون
+
 # 2. الآن نضع خيار التنظيف الاختياري (الذي يعتمد على المجلدات في هذا المسار)
 if [ "${CLEAN:-0}" = "1" ]; then
     echo -e "${YELLOW}🧹 خيار التنظيف مفعل: جارٍ حذف جميع مخلفات البناء...${NC}"
@@ -32,13 +41,6 @@ export FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 export OPENSSL_VERSION="${OPENSSL_VERSION:-3.0.13}"
 export API_LEVEL="${API_LEVEL:-24}"
 GODOT_CPP_DIR="${GODOT_CPP_DIR:-${SCRIPT_DIR}/godot-cpp}"
-
-# ─── ألوان الطرفية ────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # بدون لون
 
 log_step() { echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "${CYAN}  $1${NC}"; echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 log_ok()   { echo -e "${GREEN}✓ $1${NC}"; }
@@ -112,14 +114,20 @@ log_step "المرحلة 2: بناء FFmpeg ${FFMPEG_VERSION} + OpenSSL"
 
 FFMPEG_BUILD="${SCRIPT_DIR}/ffmpeg_build"
 
-if [ -f "${FFMPEG_BUILD}/arm64-v8a/lib/libavcodec.a" ]; then
-    log_ok "FFmpeg موجود بالفعل — تجاوز البناء (احذف ffmpeg_build/ لإعادة البناء)"
+# [FIX-4] كان هذا الفحص يتحقق فقط من مسار أندرويد (arm64-v8a)، فلم يكن
+# يكتشف أبدًا بناء Linux سابقًا — يعيد بناء FFmpeg من الصفر في كل مرة لِلينكس.
+# الآن نحسب المسار الصحيح حسب المنصة، على غرار OPENSSL_SUBDIR أعلاه تمامًا.
+FFMPEG_SUBDIR="arm64-v8a"
+[ "${TARGET_PLATFORM}" = "linux" ] && FFMPEG_SUBDIR="linux-${TARGET_ARCH:-x86_64}"
+
+if [ -f "${FFMPEG_BUILD}/${FFMPEG_SUBDIR}/lib/libavcodec.a" ]; then
+    log_ok "FFmpeg (${FFMPEG_SUBDIR}) موجود بالفعل — تجاوز البناء (احذف ffmpeg_build/ لإعادة البناء)"
 else
     chmod +x "${SCRIPT_DIR}/ffmpeg_build_android.sh"
-    "${SCRIPT_DIR}/ffmpeg_build_android.sh"
+    TARGET_PLATFORM="${TARGET_PLATFORM}" TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/ffmpeg_build_android.sh"
 fi
 
-log_ok "FFmpeg جاهز: ${FFMPEG_BUILD}"
+log_ok "FFmpeg جاهز: ${FFMPEG_BUILD}/${FFMPEG_SUBDIR}"
 
 # ─── المرحلة 3: بناء libgdffmpeg.so ──────────────────────────────────────────
 log_step "المرحلة 3: بناء libgdffmpeg.so (Godot GDExtension)"
@@ -189,6 +197,10 @@ else
     echo "  ── بناء Android arm64-v8a ──"
     TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake"
     
+    # [FIX-3] c++_static بدل c++_shared: يطابق ادعاء gdffmpeg.gdextension بأن
+    # الإضافة "لا تحتاج مكتبات خارجية مشتركة" — مع c++_shared كانت الإضافة
+    # ستعتمد وقت التشغيل على وجود libc++_shared.so داخل الـ APK فعليًا، وهو
+    # غير مضمون التضمين التلقائي من قبل Godot عند التصدير.
     cmake \
         -S "${SCRIPT_DIR}" \
         -B "${BUILD_TEMP}/arm64" \
@@ -196,7 +208,7 @@ else
         -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
         -DANDROID_ABI=arm64-v8a \
         -DANDROID_PLATFORM=android-${API_LEVEL} \
-        -DANDROID_STL=c++_shared \
+        -DANDROID_STL=c++_static \
         -DCMAKE_BUILD_TYPE=Release \
         -DGODOT_CPP_DIR="${GODOT_CPP_DIR}" \
         -DFFMPEG_DIR="${FFMPEG_BUILD}" \

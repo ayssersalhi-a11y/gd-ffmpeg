@@ -30,8 +30,16 @@ if(ANDROID)
 else()
     set(IS_ANDROID OFF)
     message(STATUS "Building for Linux")
-    set(FFMPEG_LIB_PATH "${FFMPEG_DIR}/lib")
-    set(FFMPEG_INC_PATH "${FFMPEG_DIR}/include")
+    # [FIX-4] فُصل مخرج بناء FFmpeg لِلينكس حسب المعمارية الآن (linux-x86_64 /
+    # linux-arm64) في ffmpeg_build_android.sh — نطابق ذلك هنا بنفس منطق
+    # OPENSSL_DIR أعلاه بدل الاعتماد على مسار مسطّح واحد.
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        set(FFMPEG_LIB_PATH "${FFMPEG_DIR}/linux-arm64/lib")
+        set(FFMPEG_INC_PATH "${FFMPEG_DIR}/linux-arm64/include")
+    else()
+        set(FFMPEG_LIB_PATH "${FFMPEG_DIR}/linux-x86_64/lib")
+        set(FFMPEG_INC_PATH "${FFMPEG_DIR}/linux-x86_64/include")
+    endif()
 endif()
 
 # ─── godot-cpp ────────────────────────────────────────────────────────────────

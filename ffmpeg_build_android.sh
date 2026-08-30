@@ -10,11 +10,41 @@ set -e
 # الحل المتبع: إضافة "--enable-zlib" وتضمين "-lz" في الروابط لضمان توفر
 # خدمات ضغط البيانات التي يحتاجها libavformat.
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# [v2 — إصلاحات شاملة]
+# [FIX-1] أُضيف rtmp,rtsp لـ --enable-protocol (كان الكود C++ يدعم بث RTMP/RTSP
+#         حيًا صراحة عبر reconnect_streamed دون أن يكون البروتوكول مبنيًا أصلاً).
+# [FIX-2] أُضيفت h264_mediacodec/hevc_mediacodec/vp8_mediacodec/vp9_mediacodec
+#         صراحة لـ --enable-decoder — بعد --disable-everything، تفعيل
+#         --enable-mediacodec وحده يبني البنية التحتية فقط، لا أسماء الديكودر
+#         الفعلية، فكان الكود يتراجع دائمًا وبصمت للـ Software Decode.
+# [FIX-4] فُصل مخرج بناء Linux حسب المعمارية (linux-x86_64 / linux-arm64) بدل
+#         مسار مسطّح مشترك — كان يُكتب الثاني فوق الأول عند البناء المحلي
+#         المتتابع لمعماريتين مختلفتين (راجع CMakeLists.txt المُحدَّث ليطابق).
+# [FIX-6] "if [ ! -d ... /configure ]" كان خطأً — configure ملف Perl/Shell
+#         وليس مجلدًا، فكان الشرط صحيحًا دائمًا ويُعيد تحميل/استخراج الكود
+#         المصدري لـ FFmpeg بالكامل في كل تشغيل محلي لبناء أندرويد.
+# [FIX-7] أُضيف flv,rtsp لـ --enable-demuxer — بث RTMP يُغلَّف بصيغة FLV
+#         تقريبًا دائمًا، وRTSP يحتاج اسم Demuxer منفصلاً عن اسم البروتوكول.
+# [FIX-8] أُضيف vorbis لـ --enable-decoder — معظم ملفات .ogg الحقيقية هي
+#         Vorbis لا Opus؛ روابط صوت خارجي شبكية بامتداد .ogg (عبر ext_fmt_ctx
+#         في الكود C++) كانت ستفشل بفك التشفير رغم تفعيل Demuxer الحاوية.
+# [FIX-11] أُزيل --disable-asm من بناء Linux x86_64 الأصلي (Native) فقط —
+#          تحسينات SIMD آمنة ومفيدة هنا بعكس حالات Cross-Compile، حيث أُبقي
+#          عليه احتياطًا (Android وLinux ARM64).
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FFMPEG_SRC_DIR="${SCRIPT_DIR}/ffmpeg_source"
-OUTPUT_DIR="${SCRIPT_DIR}/ffmpeg_build"
+# [FIX-4] فصل مخرجات Linux حسب المعمارية (على غرار build_openssl_android.sh)
+# بدل مسار مسطّح واحد كان يُكتب فوقه عند بناء x86_64 ثم arm64 بالتتابع محليًا.
+if [ "$TARGET_PLATFORM" = "linux" ]; then
+    OUTPUT_DIR="${SCRIPT_DIR}/ffmpeg_build/linux-${TARGET_ARCH:-x86_64}"
+else
+    OUTPUT_DIR="${SCRIPT_DIR}/ffmpeg_build"
+fi
 if [ "$TARGET_PLATFORM" = "linux" ]; then
     OPENSSL_BUILD="${SCRIPT_DIR}/openssl_build/linux-${TARGET_ARCH:-x86_64}"
 else
@@ -57,12 +87,14 @@ if [ "$TARGET_PLATFORM" = "linux" ]; then
 			--extra-libs="-lz"
 	else
 		echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع zlib و fPIC..."
-		
+
+		# [FIX-11] لا حاجة لـ --disable-asm هنا: هذا بناء أصلي (Native) على
+		# نفس معمارية x86_64، فتحسينات SIMD آمنة ومفيدة (أسرع بشكل ملحوظ)
+		# بعكس بعض حالات الـ Cross-Compile حيث أبقينا عليه احتياطًا.
 		./configure \
 			--prefix="${OUTPUT_DIR}" \
 			--enable-static --disable-shared \
 			--disable-programs --disable-doc \
-			--disable-asm \
 			--enable-pic \
 			--enable-zlib \
 			--enable-openssl \
@@ -104,10 +136,11 @@ build_abi() {
         --enable-avcodec --enable-avformat --enable-avutil --enable-swscale --enable-swresample \
         --enable-jni --enable-mediacodec \
         --enable-zlib \
-        --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg4,aac,mp3,opus,flac,ac3 \
-        --enable-demuxer=mp4,matroska,mov,avi,hls,concat,mp3,ogg,aac,flac,wav,mpegts \
-        --enable-parser=h264,hevc,aac,opus,mp3,flac \
-        --enable-protocol=file,pipe,http,https,hls,tcp,tls,ssl,crypto,data,ftp \
+        --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg4,aac,mp3,opus,flac,ac3,vorbis \
+        --enable-decoder=h264_mediacodec,hevc_mediacodec,vp8_mediacodec,vp9_mediacodec \
+        --enable-demuxer=mp4,matroska,mov,avi,hls,concat,mp3,ogg,aac,flac,wav,mpegts,flv,rtsp \
+        --enable-parser=h264,hevc,aac,opus,mp3,flac,vorbis \
+        --enable-protocol=file,pipe,http,https,hls,tcp,tls,ssl,crypto,data,ftp,rtmp,rtsp \
         --enable-openssl \
         --extra-cflags="-Os -fPIC -I${OPENSSL_BUILD}/include" \
         --extra-ldflags="-L${OPENSSL_BUILD}/lib" \
@@ -116,7 +149,7 @@ build_abi() {
     make -j"$(nproc)" && make install
 }
 
-if [ ! -d "${FFMPEG_SRC_DIR}/configure" ]; then
+if [ ! -f "${FFMPEG_SRC_DIR}/configure" ]; then
     mkdir -p "${FFMPEG_SRC_DIR}"
     wget -q --show-progress "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -O ffmpeg.tar.gz
     tar xzf ffmpeg.tar.gz -C "${FFMPEG_SRC_DIR}" --strip-components=1
