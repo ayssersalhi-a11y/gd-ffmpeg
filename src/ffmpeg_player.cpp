@@ -2,7 +2,64 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 6.3 — فتح الفيديو الشبكي بشكل غير متزامن (Async) + probesize/analyzeduration
+ * الإصدار 7.0 — قراءة شبكية بخيوط مستقلة تمامًا (لا تجمّد إطلاقًا) + مهلات زمنية
+ *
+ * ─── ما الجديد في v7.0 ────────────────────────────────────────────────────────
+ *
+ * [THREAD-SAFE-NETWORK] القراءة المستمرة (av_read_frame) والـ Seek
+ *           (av_seek_frame) كانا يُنفَّذان على الخيط الرئيسي لكل من fmt_ctx
+ *           (الفيديو) و ext_fmt_ctx (الصوت الخارجي الشبكي). إن تجمّد الاتصال
+ *           (Socket مفتوح لكن بلا بيانات ولا خطأ صريح) كان هذا يُجمّد محرك
+ *           Godot بالكامل لمدة غير محدودة — بعكس ما قد يظنه المرء من أن خيار
+ *           "reconnect" وحده كافٍ. الآن لكل منهما خيط خلفي مستقل تمامًا
+ *           (_network_read_worker / _ext_network_read_worker) يملك سياقه
+ *           الخاص حصريًا بعد فتحه؛ الخيط الرئيسي لا يستدعي أي av_read_frame
+ *           أو av_seek_frame عليهما إطلاقًا بعد ذلك — فقط يقرأ من طوابير
+ *           محمية بـ std::mutex يملؤها هذان الخيطان الخلفيان باستمرار.
+ *           عمليات الـ Seek على مصدر شبكي أصبحت طلبات ذرية (atomic) غير
+ *           حاجبة (network_seek_requested) يعالجها كل خيط بنفسه في دَوره،
+ *           والخيط الرئيسي يتابع الحالة عبر إشارة إتمام (network_seek_done)
+ *           في _process() دون أي انتظار حاجب.
+ *
+ * [TIMEOUT] أُضيف timeout/rw_timeout (15 ثانية) لفتح الفيديو الشبكي (كان
+ *           موجودًا مسبقًا فقط لفتح الصوت الخارجي)، فيحدّ أقصى مدة انتظار
+ *           لأي استدعاء قراءة منفرد حتى داخل الخيط الخلفي نفسه — يضمن ألا
+ *           يُحتجَز أي خيط إلى الأبد على اتصال ميت تمامًا بلا خطأ صريح، وأن
+ *           إغلاق الخيط لاحقًا (عند تحميل فيديو جديد أو الخروج) لا ينتظر
+ *           أكثر من هذه المهلة كحد أقصى.
+ *
+ * ─── ما الجديد في v6.5 ────────────────────────────────────────────────────────
+ *
+ * [AV-SYNC] عند استخدام صوت خارجي محلي (res://, user://, .mp3/.ogg) لا يوجد
+ *           سابقًا أي مراقبة نشطة للتزامن — موضع الفيديو كان يتقدّم بالزمن
+ *           الفعلي (position += delta) بلا أي مقارنة مع الموضع الحقيقي لمشغّل
+ *           الصوت. الآن نقارن كل ثانية بين position والموضع الفعلي المُبلَّغ
+ *           من AudioStreamPlayer::get_playback_position():
+ *             • فرق < 0.15s  → طبيعي، لا إجراء.
+ *             • فرق 0.15–0.75s → تصحيح صامت (نُطابق موضع الفيديو مع الصوت).
+ *             • فرق >= 0.75s  → تصحيح + إطلاق إشارة av_sync_issue لإعلام
+ *               الواجهة/المستخدم أن التزامن قد يكون تأثر.
+ *           (لا حاجة لهذا مع الصوت المدمج/الشبكي لأن موضع الفيديو هناك
+ *           مُشتَق حرفيًا من ساعة الصوت الفعلية — لا انجراف ممكن أصلاً).
+ *
+ * ─── ما الجديد في v6.4 ────────────────────────────────────────────────────────
+ *
+ * [BUFFER-FIX] شرط الخروج من buffering كان يحتوي "|| !decoded_frame_queue.empty()"
+ *           وبما أن أول إطار يُفكّ خلال أول Tick تقريبًا، كان هذا يُخرِج من
+ *           التخزين فورًا بغض النظر عن forward_buffer_secs الفعلي — فلا ينتظر
+ *           أبدًا الـ 5 ثوانٍ المطلوبة (INITIAL_PLAY) على شبكة ضعيفة. النتيجة:
+ *           انطلاق فوري بجزء من الثانية من البيانات، نضوب سريع، إعادة دخول
+ *           buffering، وخروج فوري مجددًا لنفس السبب → تقطّع متكرر (نصف ثانية
+ *           تشغيل / ربع ثانية توقف). الآن الشرط يعتمد حصرًا على
+ *           forward_buffer_secs (أو نفاد المصدر بالكامل EOF)، مع هدف أقصر
+ *           (REBUFFER_TARGET=2s) لإعادة التخزين بعد أول انطلاق ناجح بدل
+ *           إعادة انتظار 5 ثوانٍ في كل مرة (first_buffer_done).
+ *
+ * [STATUS-FIX] إشارة buffering_status (المغذّية لشريط التحميل في الواجهة) كانت
+ *           لا تصل إطلاقًا أثناء buffering=true بسبب "return" مبكر في _process()
+ *           قبل كود الإشارة. نُقل حساب/إطلاق هذه الإشارة إلى بداية _process()
+ *           بحيث يعمل بغضّ النظر عن حالة buffering، فيعرض شريط التحميل التقدّم
+ *           الحقيقي أثناء الانتظار الفعلي بدل القفز المفاجئ.
  *
  * ─── ما الجديد في v6.3 ────────────────────────────────────────────────────────
  *
@@ -142,6 +199,10 @@ void FFmpegPlayer::_bind_methods() {
     ADD_SIGNAL(MethodInfo("buffering_status",
         PropertyInfo(Variant::FLOAT, "low_secs"),
         PropertyInfo(Variant::FLOAT, "high_secs")));
+    // [AV-SYNC v6.5] تُطلَق عند اكتشاف انجراف بين الصوت الخارجي المحلي والفيديو
+    ADD_SIGNAL(MethodInfo("av_sync_issue",
+        PropertyInfo(Variant::STRING, "message"),
+        PropertyInfo(Variant::FLOAT, "drift_seconds")));
 }
 
 FFmpegPlayer::FFmpegPlayer() {}
@@ -160,7 +221,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v6.3 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.0 ---");
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
@@ -203,6 +264,8 @@ bool FFmpegPlayer::load_video(const String &path) {
     UtilityFunctions::print("[LOAD] Mode: ",
         is_live ? "Live Stream" : (video_is_network ? "Direct URL" : "Local File"),
         " | Audio: internal (embedded) by default, external overrides via load_audio()");
+
+    video_is_network_source = is_network; // [THREAD-SAFE v7.0]
 
     // ── [ASYNC-VIDEO v6.3] الشبكة: فتح غير متزامن في خيط خلفي ────────────────
     // لا يُجمَّد المحرك؛ النتيجة (نجاح/فشل) تصل عبر إشارة video_loaded من
@@ -263,6 +326,10 @@ void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
     av_dict_set(&opts, "flags",               "low_delay", 0);
     av_dict_set(&opts, "reconnect",           "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+    // [TIMEOUT v7.0] يحدّ أقصى مدة انتظار لأي استدعاء قراءة منفرد (حتى داخل
+    // الخيط الخلفي نفسه لاحقًا) — يمنع الاحتجاز الأبدي على اتصال ميت بصمت
+    av_dict_set(&opts, "timeout",             "15000000", 0); // 15 ثانية
+    av_dict_set(&opts, "rw_timeout",          "15000000", 0);
     // [12] لا reconnect_streamed للملفات المباشرة (غير البث الحي)
     if (is_live) av_dict_set(&opts, "reconnect_streamed", "1", 0);
 
@@ -352,7 +419,143 @@ bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_l
     _emit_video_loaded(true);
     UtilityFunctions::print("[LOAD] OK | dur=", duration, "s | fps=", fps,
         " | ", video_width, "x", video_height, " | mix=", godot_mix_rate, "Hz");
+
+    // ── [THREAD-SAFE v7.0] لمصادر الشبكة: ابدأ خيط القراءة المستمرة المستقل ──
+    // من هذه اللحظة فصاعدًا، هذا الخيط هو المالك الحصري لـ fmt_ctx.
+    if (video_is_network_source) {
+        network_reader_active = true;
+        network_read_thread = std::thread(&FFmpegPlayer::_network_read_worker, this);
+        UtilityFunctions::print("[NET-READ] Background network reader thread started.");
+    }
     return true;
+}
+
+// ─── [THREAD-SAFE v7.0] خيط القراءة الشبكية المستمرة للفيديو ─────────────────
+// يعمل هذا الخيط طوال حياة الجلسة الحالية للفيديو الشبكي. هو المالك الحصري
+// لـ fmt_ctx: يقرأ الحزم باستمرار ويدفعها في الطوابير المحمية، ويُنفّذ أي
+// طلب Seek واردًا من الخيط الرئيسي بنفسه (بدل استدعاء av_seek_frame من هناك).
+// لا يُستدعى أي av_read_frame/av_seek_frame على fmt_ctx من أي مكان آخر بتاتًا
+// طالما هذا الخيط حيّ — هذا ما يضمن عدم تجمّد الواجهة إطلاقًا مهما ساءت الشبكة.
+void FFmpegPlayer::_network_read_worker() {
+    AVPacket *pk = av_packet_alloc();
+
+    while (network_reader_active) {
+        // ── معالجة طلب Seek (نحن المالك الحصري لـ fmt_ctx، آمن تمامًا) ───────
+        if (network_seek_requested) {
+            double target = network_seek_target_secs;
+            int64_t ts = (int64_t)(target / av_q2d(fmt_ctx->streams[video_stream_idx]->time_base));
+            int sret = av_seek_frame(fmt_ctx, video_stream_idx, ts, AVSEEK_FLAG_BACKWARD);
+
+            {
+                std::lock_guard<std::mutex> lock(network_queue_mutex);
+                while (!video_packet_queue.empty())
+                    { av_packet_free(&video_packet_queue.front()); video_packet_queue.pop_front(); }
+                while (!audio_packet_queue.empty())
+                    { av_packet_free(&audio_packet_queue.front()); audio_packet_queue.pop_front(); }
+            }
+
+            network_seek_failed     = (sret < 0);
+            demux_eof_reached       = false;
+            network_seek_requested  = false;
+            network_seek_done       = true; // الخيط الرئيسي ينتظر هذا العلم في _process()
+            continue;
+        }
+
+        // ── حماية من نمو الذاكرة إن كانت الشبكة أسرع بكثير من الاستهلاك ──────
+        bool queue_full;
+        {
+            std::lock_guard<std::mutex> lock(network_queue_mutex);
+            queue_full = ((int)(video_packet_queue.size() + audio_packet_queue.size())
+                          >= NETWORK_READ_QUEUE_CAP_PACKETS);
+        }
+        if (queue_full) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
+        // ── القراءة الفعلية — قد تنتظر طويلًا على شبكة سيئة، لكننا على خيط
+        // مستقل تمامًا عن Godot، فلا يتأثر المحرك أو الواجهة إطلاقًا ──────────
+        int ret = av_read_frame(fmt_ctx, pk);
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                demux_eof_reached = true;
+                // ننام بهدوء بدل الخروج الكامل: قد يصل طلب Seek(0) لاحقًا
+                // (تكرار Loop) ونحتاج هذا الخيط حيًا لمعالجته
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } else {
+                network_read_error_flag = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            continue;
+        }
+
+        if (pk->stream_index == video_stream_idx ||
+            (!use_external_audio && pk->stream_index == audio_stream_idx)) {
+            AVPacket *clone = av_packet_clone(pk);
+            std::lock_guard<std::mutex> lock(network_queue_mutex);
+            if (pk->stream_index == video_stream_idx)
+                video_packet_queue.push_back(clone);
+            else
+                audio_packet_queue.push_back(clone);
+        }
+        av_packet_unref(pk);
+    }
+
+    av_packet_free(&pk);
+}
+
+// ─── [THREAD-SAFE v7.0] خيط القراءة الشبكية المستمرة للصوت الخارجي ──────────
+// نفس فلسفة _network_read_worker تمامًا لكن لـ ext_fmt_ctx (صوت خارجي شبكي).
+void FFmpegPlayer::_ext_network_read_worker() {
+    AVPacket *pk = av_packet_alloc();
+
+    while (ext_network_reader_active) {
+        if (ext_network_seek_requested) {
+            double target = ext_network_seek_target_secs;
+            int64_t ats = (int64_t)(target / av_q2d(ext_fmt_ctx->streams[ext_audio_stream]->time_base));
+            av_seek_frame(ext_fmt_ctx, ext_audio_stream, ats, AVSEEK_FLAG_BACKWARD);
+            if (ext_audio_ctx) avcodec_flush_buffers(ext_audio_ctx);
+            {
+                std::lock_guard<std::mutex> lock(ext_network_queue_mutex);
+                for (auto *p : ext_audio_pkt_queue) av_packet_free(&p);
+                ext_audio_pkt_queue.clear();
+            }
+            ext_audio_eof = false;
+            ext_network_seek_requested = false;
+            continue;
+        }
+
+        bool queue_full;
+        {
+            std::lock_guard<std::mutex> lock(ext_network_queue_mutex);
+            queue_full = ((int)ext_audio_pkt_queue.size() >= MAX_AUDIO_FRAMES * 4);
+        }
+        if (queue_full) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
+        int ret = av_read_frame(ext_fmt_ctx, pk);
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                ext_audio_eof = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } else {
+                ext_network_read_error_flag = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            continue;
+        }
+
+        if (pk->stream_index == ext_audio_stream) {
+            AVPacket *clone = av_packet_clone(pk);
+            std::lock_guard<std::mutex> lock(ext_network_queue_mutex);
+            ext_audio_pkt_queue.push_back(clone);
+        }
+        av_packet_unref(pk);
+    }
+
+    av_packet_free(&pk);
 }
 
 // ─── إعداد كودك الفيديو ───────────────────────────────────────────────────────
@@ -530,6 +733,10 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
     ext_using_godot_player = false;
     _reset_last_audio_pts();
 
+    // ── [THREAD-SAFE v7.0] ابدأ خيط القراءة المستمرة المستقل لهذا المصدر ──────
+    ext_network_reader_active = true;
+    ext_network_read_thread = std::thread(&FFmpegPlayer::_ext_network_read_worker, this);
+
     UtilityFunctions::print("[DEBUG-AUDIO] Success! Audio is ready to play.");
     emit_signal("audio_loaded", true);
     return true;
@@ -539,8 +746,24 @@ bool FFmpegPlayer::_open_audio_with_ffmpeg(const String &path) {
 
 // ─── تنظيف الصوت الخارجي ──────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup_ext_audio() {
-    for (auto *p : ext_audio_pkt_queue)   av_packet_free(&p);
-    ext_audio_pkt_queue.clear();
+    // [THREAD-SAFE v7.0] أوقف خيط القراءة الشبكية أولًا وقبل كل شيء —
+    // إغلاق ext_fmt_ctx أثناء قراءة الخيط له كارثي (استخدام بعد التحرير)
+    // [TODO-مستقبلًا] نفس ملاحظة _cleanup() الخاصة بخيط الفيديو: هذا join()
+    // محدود بـ timeout الفتح (15s) كحد أقصى، فقط عند تبديل/إلغاء الصوت
+    // الخارجي أثناء انقطاع شبكي كامل. حلّه الجذري (Detach + تنظيف ذاتي +
+    // generation counter) نفس الفكرة تمامًا — مؤجَّل لنفس السبب.
+    if (ext_network_reader_active) {
+        ext_network_reader_active = false;
+        if (ext_network_read_thread.joinable()) ext_network_read_thread.join();
+    }
+    ext_network_seek_requested  = false;
+    ext_network_read_error_flag = false;
+
+    {
+        std::lock_guard<std::mutex> lock(ext_network_queue_mutex);
+        for (auto *p : ext_audio_pkt_queue)   av_packet_free(&p);
+        ext_audio_pkt_queue.clear();
+    }
     for (auto *f : ext_audio_frame_queue) av_frame_free(&f);
     ext_audio_frame_queue.clear();
 
@@ -774,6 +997,47 @@ void FFmpegPlayer::_reset_last_audio_pts() {
     audio_resync_needed = false;
 }
 
+// ─── [AV-SYNC v6.5] كشف وتصحيح انجراف الصوت الخارجي المحلي عن الفيديو ────────
+// يُستدعى فقط في مسار "position += delta" (أي عند ext_using_godot_player).
+// المبدأ: نقرأ الوقت الحقيقي الذي وصله مشغّل الصوت (Godot) فعليًا عبر
+// get_playback_position()، ونقارنه بموضع الفيديو الحالي (position):
+//   • فرق صغير جدًا (< AV_SYNC_RESYNC_THRESHOLD)  → طبيعي، لا إجراء.
+//   • فرق مقبول لكنه محسوس                          → تصحيح صامت (نطابق
+//     position مع الصوت فورًا، بلا إشعار المستخدم لأنه غير ملحوظ عمليًا).
+//   • فرق كبير وملحوظ (>= AV_SYNC_WARNING_THRESHOLD) → نُصحّح الموضع + نُصدر
+//     إشارة av_sync_issue لإعلام الواجهة/المستخدم أن التزامن قد يكون تأثر.
+void FFmpegPlayer::_check_av_sync(double delta) {
+    if (!ext_using_godot_player || !ext_audio_player) return;
+    if (!ext_audio_player->is_playing()) return;
+
+    av_sync_check_timer += delta;
+    if (av_sync_check_timer < AV_SYNC_CHECK_INTERVAL) return;
+    av_sync_check_timer = 0.0;
+
+    double actual_audio_pos = (double)ext_audio_player->get_playback_position();
+    double drift     = position - actual_audio_pos; // موجب = الفيديو متقدم على الصوت
+    double abs_drift = (drift < 0.0) ? -drift : drift;
+
+    if (abs_drift < AV_SYNC_RESYNC_THRESHOLD) {
+        return; // فرق طبيعي ضمن الحدود المقبولة — لا إجراء
+    }
+
+    if (abs_drift >= AV_SYNC_WARNING_THRESHOLD) {
+        String msg = (drift > 0.0)
+            ? "قد لا يوجد تزامن: الصورة متقدمة على الصوت بحوالي " + String::num(abs_drift, 2) + "ث"
+            : "قد لا يوجد تزامن: الصوت متقدم على الصورة بحوالي " + String::num(abs_drift, 2) + "ث";
+        UtilityFunctions::printerr("[AV-SYNC] ", msg);
+        if (is_inside_tree()) emit_signal("av_sync_issue", msg, (float)abs_drift);
+    } else {
+        UtilityFunctions::print("[AV-SYNC] Minor drift auto-corrected: ", drift, "s");
+    }
+
+    // تصحيح فعلي في الحالتين (المقبول والملحوظ): نُعيد مطابقة موضع الفيديو
+    // لموضع الصوت الحقيقي — الصوت هو المرجع لأن أذن المستمع أكثر حساسية
+    // لتقطّعه من حساسية العين لقفزة إطار واحدة في الصورة.
+    position = actual_audio_pos;
+}
+
 // ─── [7] التعافي التلقائي من الفجوات الزمنية ─────────────────────────────────
 void FFmpegPlayer::_handle_audio_gap(double gap_secs) {
     if (gap_secs < AUDIO_GAP_RESYNC_S) return;
@@ -1005,7 +1269,9 @@ void FFmpegPlayer::seek(double seconds) {
                    seconds <= position + forward_buffer_secs - 0.5);
 
     if (in_buf) {
-        // Fast Seek
+        // Fast Seek — لا يلمس video_packet_queue/audio_packet_queue إطلاقًا
+        // (فقط طوابير فك التشفير المحلية للخيط الرئيسي)، لذا آمن كما هو
+        // بغض النظر عن نشاط أي خيط قراءة شبكي.
         while (!decoded_frame_queue.empty() &&
                decoded_frame_queue.front().pts < seconds)
             decoded_frame_queue.pop_front();
@@ -1020,8 +1286,34 @@ void FFmpegPlayer::seek(double seconds) {
         }
         position = seconds; frame_timer = 0.0; buffering = false;
         UtilityFunctions::print("[SEEK] Fast → ", seconds);
+
+    } else if (network_reader_active) {
+        // ── [THREAD-SAFE v7.0] Full Seek على مصدر شبكي ──────────────────────
+        // لا نستدعي av_seek_frame على fmt_ctx من هنا إطلاقًا (المالك الحصري
+        // له هو _network_read_worker). نُرسل طلبًا ذريًا غير حاجب ونعود فورًا؛
+        // _process() سيتابع الحالة عبر network_seek_done دون أي انتظار.
+        _clear_queues(); // آمن (محمي بالقفل داخليًا) — يمسح طوابير فك التشفير أيضًا
+
+        pending_video_seek_target   = seconds;
+        pending_video_seek_active   = true;
+        pending_autoplay_after_seek = was_playing;
+
+        network_seek_done       = false;
+        network_seek_failed     = false;
+        network_seek_target_secs = seconds;
+        network_seek_requested   = true;
+
+        // نفس الأمر للصوت الخارجي الشبكي إن كان نشطًا — يعالج نفسه بنفسه
+        if (ext_network_reader_active) {
+            ext_network_seek_target_secs = seconds;
+            ext_network_seek_requested   = true;
+        }
+
+        UtilityFunctions::print("[SEEK] Network seek requested → ", seconds);
+        return; // buffering يبقى true، playing يبقى false حتى تكتمل العملية
+
     } else {
-        // Full Seek
+        // Full Seek لملف محلي — متزامن وآمن تمامًا (لا شبكة، لا خيوط قراءة)
         _clear_queues(); // [6] يمسح كل شيء
         // [v6.2] لم نعد عند EOF بعد أي seek ناجح
         demux_eof_reached = false;
@@ -1041,27 +1333,42 @@ void FFmpegPlayer::seek(double seconds) {
                                      SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         }
 
-        // seek في الصوت الخارجي
-        if (ext_fmt_ctx && ext_audio_stream >= 0) {
+        // seek في الصوت الخارجي (محلي أيضًا في هذه الحالة النظرية فقط —
+        // عمليًا ext_fmt_ctx شبكي دائمًا ويُعالَج في الفرع أعلاه، لكن نُبقي
+        // هذا كخط دفاع احتياطي لو تغيّرت الافتراضات مستقبلًا)
+        if (ext_fmt_ctx && ext_audio_stream >= 0 && !ext_network_reader_active) {
             int64_t ats = (int64_t)(seconds / av_q2d(ext_fmt_ctx->streams[ext_audio_stream]->time_base));
             av_seek_frame(ext_fmt_ctx, ext_audio_stream, ats, AVSEEK_FLAG_BACKWARD);
             if (ext_audio_ctx) avcodec_flush_buffers(ext_audio_ctx);
-            for (auto *p : ext_audio_pkt_queue)    av_packet_free(&p);
-            ext_audio_pkt_queue.clear();
+            {
+                std::lock_guard<std::mutex> lock(ext_network_queue_mutex);
+                for (auto *p : ext_audio_pkt_queue) av_packet_free(&p);
+                ext_audio_pkt_queue.clear();
+            }
             for (auto *f : ext_audio_frame_queue)  av_frame_free(&f);
             ext_audio_frame_queue.clear();
             ext_audio_eof = false;
+        } else if (ext_network_reader_active) {
+            ext_network_seek_target_secs = seconds;
+            ext_network_seek_requested   = true;
         }
 
         position = seconds; frame_timer = 0.0; forward_buffer_secs = 0.0;
         if (is_inside_tree()) emit_signal("buffering_changed", true);
-        _prefill_buffers();
 
-        if (forward_buffer_secs >= INITIAL_PLAY || !decoded_frame_queue.empty()) {
+        // [BUFFER-FIX v6.4] نفس منطق الهدف المتغيّر: 5s أول تخزين، 2s لاحقًا
+        double target = first_buffer_done ? REBUFFER_TARGET : INITIAL_PLAY;
+        _prefill_buffers(target);
+
+        bool enough_buffered  = forward_buffer_secs >= target;
+        bool stream_exhausted = demux_eof_reached && video_packet_queue.empty();
+
+        if (enough_buffered || (stream_exhausted && !decoded_frame_queue.empty())) {
             buffering = false;
+            first_buffer_done = true;
             if (is_inside_tree()) emit_signal("buffering_changed", false);
         }
-        UtilityFunctions::print("[SEEK] Full → ", seconds, " fwd=", forward_buffer_secs);
+        UtilityFunctions::print("[SEEK] Full → ", seconds, " fwd=", forward_buffer_secs, " target=", target);
     }
 
     if (was_playing) {
@@ -1097,7 +1404,44 @@ void FFmpegPlayer::_process(double delta) {
         _emit_video_loaded(false);
     }
 
+    // ── [THREAD-SAFE v7.0] التقاط نتيجة عملية Seek شبكية من الخيط الخلفي ─────
+    // يجب أيضًا أن يحدث قبل early-return لأن playing=false طوال فترة الانتظار
+    if (pending_video_seek_active && network_seek_done) {
+        pending_video_seek_active = false;
+        network_seek_done = false;
+
+        if (network_seek_failed) {
+            _emit_playback_error("Seek failed (network): " + String::num(pending_video_seek_target, 2) + "s");
+            buffering = false;
+            if (is_inside_tree()) emit_signal("buffering_changed", false);
+            playing = pending_autoplay_after_seek;
+        } else {
+            position = pending_video_seek_target;
+            frame_timer = 0.0; forward_buffer_secs = 0.0;
+            // buffering يبقى true؛ الحلقة الطبيعية أدناه (if (buffering)) ستملأ
+            // المخزن تدريجيًا من نقطة الـ Seek الجديدة (يقرأها الخيط الخلفي
+            // الآن باستمرار) وتخرج تلقائيًا بمجرد بلوغ الهدف — تمامًا كإعادة
+            // تخزين عادية بعد Underrun، بلا أي انتظار حاجب على الإطلاق.
+            playing = pending_autoplay_after_seek;
+            if (playing && is_inside_tree()) emit_signal("buffering_changed", true);
+            UtilityFunctions::print("[SEEK] Network seek applied → ", position);
+        }
+    }
+
     if (!fmt_ctx || !playing) return;
+
+    // ── [THREAD-SAFE v7.0] تنبيه دوري (مُهدَّأ) بأخطاء القراءة الشبكية ────────
+    // لا يوقف أي شيء — فقط إعلام؛ الخيوط الخلفية تستمر بالمحاولة تلقائيًا.
+    network_error_notify_timer += delta;
+    if (network_error_notify_timer >= NETWORK_ERROR_NOTIFY_INTERVAL) {
+        network_error_notify_timer = 0.0;
+        if (network_read_error_flag.exchange(false)) {
+            _emit_playback_error("Network read error — retrying in background...");
+        }
+        if (ext_network_read_error_flag.exchange(false)) {
+            _emit_playback_error("External audio network read error — retrying in background...");
+        }
+    }
 
     // التحقق الآمن من نجاح تحميل الصوت الشبكي في الخيط الرئيسي
     if (audio_load_finished_successfully) {
@@ -1117,6 +1461,16 @@ void FFmpegPlayer::_process(double delta) {
 
     _update_buffer_stats();
 
+    // ── [STATUS-FIX v6.4] إشارة حالة التخزين تُطلَق دائمًا — حتى أثناء
+    // buffering=true — كي يتحدّث شريط التحميل فعليًا أمام المستخدم أثناء
+    // الانتظار الحقيقي (كانت سابقًا تُحسب بعد "return" المبكر لمرحلة
+    // buffering فلا تصل أبدًا أثناء التخزين الفعلي).
+    status_timer += delta;
+    if (status_timer >= STATUS_INTERVAL) {
+        status_timer = 0.0;
+        _emit_buffering_status();
+    }
+
     // مرحلة التعبئة (Buffering)
     if (buffering) {
         _read_packets_to_queue();
@@ -1127,8 +1481,17 @@ void FFmpegPlayer::_process(double delta) {
         if (external_audio_requested && ext_audio_ctx)
             _decode_ext_audio_into_queue();
 
-        if (forward_buffer_secs >= INITIAL_PLAY || !decoded_frame_queue.empty()) {
+        // ── [BUFFER-FIX v6.4] شرط خروج صحيح: لا نخرج لمجرد فك إطار واحد.
+        // نخرج فقط إذا امتلأ المخزن فعليًا للهدف المطلوب (5s أول مرة، أو 2s
+        // لإعادة التخزين اللاحقة)، أو إذا نفد المصدر بالكامل (EOF) فلم يعد
+        // هناك ما ننتظره أصلاً.
+        double target = first_buffer_done ? REBUFFER_TARGET : INITIAL_PLAY;
+        bool enough_buffered  = forward_buffer_secs >= target;
+        bool stream_exhausted = demux_eof_reached && video_packet_queue.empty();
+
+        if (enough_buffered || (stream_exhausted && !decoded_frame_queue.empty())) {
             buffering = false;
+            first_buffer_done = true;
             if (is_inside_tree()) emit_signal("buffering_changed", false);
             _start_audio_at(position);
         }
@@ -1178,6 +1541,9 @@ void FFmpegPlayer::_process(double delta) {
         position = audio_clk;
     } else {
         position += delta;
+        // [AV-SYNC v6.5] هذا المسار (صوت خارجي محلي عبر AudioStreamPlayer) هو
+        // الوحيد الذي لا يعتمد على ساعة صوت فعلية، لذا نراقبه ونصححه هنا
+        _check_av_sync(delta);
     }
 
     frame_timer += delta;
@@ -1212,12 +1578,6 @@ void FFmpegPlayer::_process(double delta) {
         else if (audio_active_source == AudioActiveSource::EXTERNAL_STREAM &&
                  ext_audio_stream >= 0 && ext_swr_ctx)
             _push_audio_frames(ext_audio_frame_queue, ext_swr_ctx, 0);
-    }
-
-    // [4] إشارة الحالة كل 0.5 ثانية
-    status_timer += delta;
-    if (status_timer >= STATUS_INTERVAL) {
-        status_timer = 0.0; _emit_buffering_status();
     }
 
     // ─── [EOF-FIX v6.2] الاكتشاف الحقيقي لنهاية الفيديو ──────────────────────
@@ -1272,12 +1632,15 @@ void FFmpegPlayer::_process(double delta) {
 
 
 // ─── _update_buffer_stats ──────────────────────────────────────────────────────
+// [THREAD-SAFE v7.0] video_packet_queue قد يُكتب إليه من خيط القراءة الشبكية
+// في نفس اللحظة، لذا نحمي القراءة هنا بالقفل.
 void FFmpegPlayer::_update_buffer_stats() {
     if (video_stream_idx < 0 || !fmt_ctx) return;
     double tb     = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
     double vstart = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
                     ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
 
+    std::lock_guard<std::mutex> lock(network_queue_mutex);
     if (video_packet_queue.empty())
         forward_buffer_secs = decoded_frame_queue.empty() ? 0.0
             : Math::max(0.0, decoded_frame_queue.back().pts - position);
@@ -1295,8 +1658,18 @@ int FFmpegPlayer::_calc_read_batch_size() const {
 }
 
 // ─── قراءة الحزم الخام ────────────────────────────────────────────────────────
+// [THREAD-SAFE v7.0] لمصادر الشبكة: القراءة الفعلية تتم بالكامل في
+// _network_read_worker على خيط مستقل. هذه الدالة هنا فقط تُنظّف الحزم
+// القديمة (للملفات المحلية تبقى القراءة متزامنة كما كانت تمامًا — آمنة
+// وسريعة لأن قراءة القرص لا تُجمّد شيئًا).
 void FFmpegPlayer::_read_packets_to_queue() {
     if (!fmt_ctx) return;
+
+    if (network_reader_active) {
+        _trim_old_packets();
+        return;
+    }
+
     int batch    = _calc_read_batch_size();
     AVPacket *pk = av_packet_alloc();
 
@@ -1311,15 +1684,26 @@ void FFmpegPlayer::_read_packets_to_queue() {
             }
             av_packet_unref(pk); break;
         }
-        if (pk->stream_index == video_stream_idx)
-            video_packet_queue.push_back(av_packet_clone(pk));
-        else if (!use_external_audio && pk->stream_index == audio_stream_idx)
-            audio_packet_queue.push_back(av_packet_clone(pk));
+        {
+            std::lock_guard<std::mutex> lock(network_queue_mutex);
+            if (pk->stream_index == video_stream_idx)
+                video_packet_queue.push_back(av_packet_clone(pk));
+            else if (!use_external_audio && pk->stream_index == audio_stream_idx)
+                audio_packet_queue.push_back(av_packet_clone(pk));
+        }
         av_packet_unref(pk);
     }
     av_packet_free(&pk);
 
-    // حذف الحزم القديمة
+    _trim_old_packets();
+}
+
+// ─── [THREAD-SAFE v7.0] تنظيف الحزم القديمة — دالة منفصلة يستدعيها كل من
+// المسار المتزامن (ملفات محلية) والمسار الشبكي (بعد أن يملأها الخيط الخلفي) ──
+void FFmpegPlayer::_trim_old_packets() {
+    if (!fmt_ctx) return;
+    std::lock_guard<std::mutex> lock(network_queue_mutex);
+
     if (video_stream_idx >= 0) {
         double tb     = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
         double vstart = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
@@ -1343,8 +1727,13 @@ void FFmpegPlayer::_read_packets_to_queue() {
 }
 
 // ─── قراءة حزم الصوت الخارجي ─────────────────────────────────────────────────
+// [THREAD-SAFE v7.0] عندما يكون خيط القراءة الشبكية للصوت الخارجي نشطًا
+// (وهي الحالة الوحيدة العملية لـ ext_fmt_ctx)، هو من يقرأ بالكامل؛ هذه
+// الدالة تصبح no-op حينها لتفادي أي استدعاء av_read_frame من الخيط الرئيسي.
 void FFmpegPlayer::_read_ext_audio_packets() {
-    if (!ext_fmt_ctx || ext_audio_stream < 0 || ext_audio_eof) return;
+    if (!ext_fmt_ctx || ext_audio_stream < 0) return;
+    if (ext_network_reader_active) return;
+    if (ext_audio_eof) return;
     if ((int)ext_audio_pkt_queue.size() >= MAX_AUDIO_FRAMES * 2) return;
 
     AVPacket *pk = av_packet_alloc();
@@ -1397,8 +1786,17 @@ void FFmpegPlayer::_decode_packets_into_queue() {
             av_frame_unref(vf); continue;
         }
         if (ret == AVERROR(EAGAIN)) {
-            if (video_packet_queue.empty()) break;
-            AVPacket *p = video_packet_queue.front(); video_packet_queue.pop_front();
+            // [THREAD-SAFE v7.0] video_packet_queue قد يُكتب إليه من خيط
+            // القراءة الشبكية في نفس اللحظة — نحمي السحب منه بالقفل.
+            AVPacket *p = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(network_queue_mutex);
+                if (!video_packet_queue.empty()) {
+                    p = video_packet_queue.front();
+                    video_packet_queue.pop_front();
+                }
+            }
+            if (!p) break;
             int sr = avcodec_send_packet(video_codec_ctx, p); av_packet_free(&p);
             if (sr < 0 && sr != AVERROR(EAGAIN)) break;
         } else break;
@@ -1418,8 +1816,16 @@ void FFmpegPlayer::_decode_audio_into_queue() {
         if (ret == 0) { decoded_audio_queue.push_back(af); continue; }
         av_frame_free(&af);
         if (ret == AVERROR(EAGAIN)) {
-            if (audio_packet_queue.empty()) break;
-            AVPacket *p = audio_packet_queue.front(); audio_packet_queue.pop_front();
+            // [THREAD-SAFE v7.0] نفس الحماية لـ audio_packet_queue
+            AVPacket *p = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(network_queue_mutex);
+                if (!audio_packet_queue.empty()) {
+                    p = audio_packet_queue.front();
+                    audio_packet_queue.pop_front();
+                }
+            }
+            if (!p) break;
             int sr = avcodec_send_packet(audio_codec_ctx, p); av_packet_free(&p);
             if (sr < 0 && sr != AVERROR(EAGAIN)) break;
         } else break;
@@ -1438,8 +1844,16 @@ void FFmpegPlayer::_decode_ext_audio_into_queue() {
         if (ret == 0) { ext_audio_frame_queue.push_back(af); continue; }
         av_frame_free(&af);
         if (ret == AVERROR(EAGAIN)) {
-            if (ext_audio_pkt_queue.empty()) break;
-            AVPacket *p = ext_audio_pkt_queue.front(); ext_audio_pkt_queue.pop_front();
+            // [THREAD-SAFE v7.0] نفس الحماية لـ ext_audio_pkt_queue
+            AVPacket *p = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(ext_network_queue_mutex);
+                if (!ext_audio_pkt_queue.empty()) {
+                    p = ext_audio_pkt_queue.front();
+                    ext_audio_pkt_queue.pop_front();
+                }
+            }
+            if (!p) break;
             int sr = avcodec_send_packet(ext_audio_ctx, p); av_packet_free(&p);
             if (sr < 0 && sr != AVERROR(EAGAIN)) break;
         } else break;
@@ -1485,11 +1899,13 @@ bool FFmpegPlayer::_present_frame_at(double pos) {
     return true;
 }
 // ─── الملء الأولي ─────────────────────────────────────────────────────────────
-void FFmpegPlayer::_prefill_buffers() {
+// [BUFFER-FIX v6.4] target_secs قابل للتغيير: 5s للتخزين الابتدائي الأول،
+// 2s (REBUFFER_TARGET) لإعادة التخزين اللاحقة بعد Underrun أو Seek.
+void FFmpegPlayer::_prefill_buffers(double target_secs) {
     if (!fmt_ctx) return;
-    UtilityFunctions::print("[PREFILL] → ", INITIAL_PLAY, "s...");
+    UtilityFunctions::print("[PREFILL] → ", target_secs, "s...");
     int tries = 0;
-    while (forward_buffer_secs < INITIAL_PLAY && tries++ < 400) {
+    while (forward_buffer_secs < target_secs && tries++ < 400) {
         _read_packets_to_queue(); _update_buffer_stats();
     }
     _decode_packets_into_queue();
@@ -1505,18 +1921,26 @@ void FFmpegPlayer::_prefill_buffers() {
 }
 
 // ─── get_buffer_status ────────────────────────────────────────────────────────
+// [BUFFER-FIX v6.4] النسبة تُحسَب بالنسبة للهدف الفعلي الحالي (5s أول مرة،
+// أو 2s لإعادة التخزين اللاحقة) كي تعكس واجهة المستخدم 100% عند الهدف الصحيح.
 float FFmpegPlayer::get_buffer_status() {
-    if (forward_buffer_secs >= INITIAL_PLAY) return 100.0f;
-    float p = (float)(forward_buffer_secs / INITIAL_PLAY) * 100.0f;
+    double target = first_buffer_done ? REBUFFER_TARGET : INITIAL_PLAY;
+    if (forward_buffer_secs >= target) return 100.0f;
+    float p = (float)(forward_buffer_secs / target) * 100.0f;
     return p < 0.0f ? 0.0f : p;
 }
 
 // ─── [6] تنظيف كامل للطوابير ──────────────────────────────────────────────────
 void FFmpegPlayer::_clear_queues() {
-    while (!video_packet_queue.empty())
-        { av_packet_free(&video_packet_queue.front()); video_packet_queue.pop_front(); }
-    while (!audio_packet_queue.empty())
-        { av_packet_free(&audio_packet_queue.front()); audio_packet_queue.pop_front(); }
+    // [THREAD-SAFE v7.0] video_packet_queue/audio_packet_queue قد يُكتب
+    // إليهما من خيط القراءة الشبكية في نفس اللحظة — نحمي المسح بالقفل.
+    {
+        std::lock_guard<std::mutex> lock(network_queue_mutex);
+        while (!video_packet_queue.empty())
+            { av_packet_free(&video_packet_queue.front()); video_packet_queue.pop_front(); }
+        while (!audio_packet_queue.empty())
+            { av_packet_free(&audio_packet_queue.front()); audio_packet_queue.pop_front(); }
+    }
     // [6] مسح الصوت المُفكَّك أيضاً
     while (!decoded_audio_queue.empty())
         { av_frame_free(&decoded_audio_queue.front()); decoded_audio_queue.pop_front(); }
@@ -1555,8 +1979,33 @@ void FFmpegPlayer::_cleanup() {
     pending_video_fmt_ctx  = nullptr;
     pending_video_error_message = "";
 
+    // [THREAD-SAFE v7.0] أوقف خيط قراءة الفيديو الشبكي المستمر قبل إغلاق
+    // fmt_ctx — إغلاقه أثناء قراءة الخيط له كارثي (استخدام بعد التحرير).
+    // بفضل timeout/rw_timeout (15s) المضبوطة عند الفتح، هذا الانتظار محدود
+    // بحد أقصى معروف حتى في أسوأ سيناريو (اتصال ميت تمامًا بلا خطأ صريح).
+    //
+    // [TODO-مستقبلًا] هذا الـ join() هو آخر نقطة يمكن أن ينتظر فيها الخيط
+    // الرئيسي (حتى 15 ثانية كحد أقصى، وليس أثناء التشغيل العادي، فقط إن
+    // بدّل المستخدم الفيديو أو أغلق التطبيق بالضبط لحظة انقطاع شبكي كامل).
+    // لإزالة هذا الانتظار نهائيًا يجب التحوّل لنمط "Detach + تنظيف ذاتي":
+    // تمرير fmt_ctx كمتغيّر محلي للخيط (بدل الاعتماد على عضو الكائن)، وجعل
+    // الخيط نفسه يُغلق fmt_ctx ويخرج بمفرده عند اكتشاف طلب التوقف، مع خيط
+    // (generation counter) يُميّز حزم الجلسة القديمة عن الجديدة كي لا تتسرب
+    // حزم من خيط يتيم متأخر إلى طوابير تحميل فيديو جديد بدأ بالفعل. لم يُطبَّق
+    // الآن لتفادي التعقيد ومخاطر تلوّث الطوابير بين الجلسات دون داعٍ ملحّ.
+    if (network_reader_active) {
+        network_reader_active = false;
+        if (network_read_thread.joinable()) network_read_thread.join();
+    }
+    network_seek_requested     = false;
+    network_seek_done          = false;
+    network_seek_failed        = false;
+    network_read_error_flag    = false;
+    pending_video_seek_active  = false;
+    video_is_network_source    = false;
+
     _clear_queues();
-    _cleanup_ext_audio();
+    _cleanup_ext_audio(); // يوقف ext_network_read_thread داخليًا أيضًا الآن
     _stop_audio();
 
     if (video_codec_ctx) { avcodec_free_context(&video_codec_ctx); video_codec_ctx = nullptr; }
@@ -1579,9 +2028,12 @@ void FFmpegPlayer::_cleanup() {
     loaded_audio_path = ""; ext_using_godot_player = false;
     audio_samples_pushed = 0; audio_clock_offset = 0.0; audio_clock_active = false;
     last_audio_pts = -1.0; audio_resync_needed = false;
+    av_sync_check_timer = 0.0; // [AV-SYNC v6.5]
 
     // [v6.2] إعادة ضبط حالة EOF وأولوية مصدر الصوت
     demux_eof_reached        = false;
+    // [BUFFER-FIX v6.4] كل تحميل جديد يبدأ بتخزين ابتدائي كامل (5s) من جديد
+    first_buffer_done        = false;
     audio_active_source      = AudioActiveSource::NONE;
     external_audio_requested = false;
     external_audio_ready     = false;
