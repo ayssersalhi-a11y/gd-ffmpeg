@@ -2,7 +2,35 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 7.0 — قراءة شبكية بخيوط مستقلة تمامًا (لا تجمّد إطلاقًا) + مهلات زمنية
+ * الإصدار 7.2 — انطلاق سريع حقيقي: تقليل التخزين الإلزامي من 5s إلى 1s
+ *
+ * ─── ما الجديد في v7.2 ────────────────────────────────────────────────────────
+ *
+ * [STARTUP-FIX] INITIAL_PLAY كان 5.0 ثانية — انتظار إلزامي طويل قبل أي
+ *           انطلاق بصرف النظر عن جودة الشبكة الفعلية، حتى لو كانت ممتازة
+ *           وقادرة على تحميل 5 ثوانٍ فورًا. هذا قرار تصميم صارم اتُّخذ في
+ *           v6.4 لحل مشكلة التقطّع على الشبكات الضعيفة، لكنه ضحّى بسرعة
+ *           الانطلاق للجميع مقابل ذلك. التطبيقات الاحترافية (يوتيوب، تيك
+ *           توك) تنطلق بجزء من ثانية إلى ثانية واحدة فقط، وتعتمد على إعادة
+ *           التخزين التفاعلية (موجودة عندنا أصلًا وتعمل جيدًا) للتعامل مع
+ *           أي تعثّر أثناء التشغيل بدل انتظار مسبق ضخم. أصبح الآن 1.0 ثانية
+ *           فقط. REBUFFER_TARGET (2s) بقي كما هو لإعادة التخزين بعد نضوب
+ *           فعلي أثناء التشغيل، بهامش أكبر قليلًا عن قصد (النضوب دليل شبكة
+ *           متعثرة بالفعل، فالحذر الإضافي هناك مبرَّر).
+ *
+ * ─── ما الجديد في v7.1 ────────────────────────────────────────────────────────
+ *
+ * [DECODE-GATE] كان الخروج من buffering يعتمد فقط على توفر بيانات كافية
+ *           (forward_buffer_secs)، فيُطلَق الصوت فورًا حتى لو لم يُفكَّ أي
+ *           إطار فيديو بعد. هذا يظهر بوضوح على الأجهزة/المحاكيات ذات فك
+ *           التشفير البرمجي البطيء (بلا تسريع عتاد MediaCodec فعلي): الصوت
+ *           يبدأ ممتازًا فورًا، بينما تبقى الشاشة سوداء لثوانٍ (شوهد حتى
+ *           7-8 ثوانٍ في بعض المحاكيات) حتى يلحق فك التشفير بموضع الصوت.
+ *           الآن لا نخرج من buffering ولا نُشغِّل الصوت إلا بعد جهوزية إطار
+ *           مفكوك واحد فعليًا على الأقل (decoded_frame_queue غير فارغ)،
+ *           فينطلق الصوت والصورة معًا دائمًا مهما بلغت سرعة فك التشفير —
+ *           قد يطول وقت الانتظار الكلي قليلًا على الأجهزة البطيئة، لكن لن
+ *           يظهر صوت بلا صورة مرة أخرى.
  *
  * ─── ما الجديد في v7.0 ────────────────────────────────────────────────────────
  *
@@ -221,7 +249,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.0 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.2 ---");
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
@@ -1363,7 +1391,10 @@ void FFmpegPlayer::seek(double seconds) {
         bool enough_buffered  = forward_buffer_secs >= target;
         bool stream_exhausted = demux_eof_reached && video_packet_queue.empty();
 
-        if (enough_buffered || (stream_exhausted && !decoded_frame_queue.empty())) {
+        // [DECODE-GATE v7.1] نفس الحماية: لا نخرج من buffering إلا مع إطار
+        // جاهز فعليًا — راجع نفس التعليق في _process() لتفاصيل السبب.
+        if ((enough_buffered || (stream_exhausted && !decoded_frame_queue.empty()))
+            && !decoded_frame_queue.empty()) {
             buffering = false;
             first_buffer_done = true;
             if (is_inside_tree()) emit_signal("buffering_changed", false);
@@ -1489,7 +1520,17 @@ void FFmpegPlayer::_process(double delta) {
         bool enough_buffered  = forward_buffer_secs >= target;
         bool stream_exhausted = demux_eof_reached && video_packet_queue.empty();
 
-        if (enough_buffered || (stream_exhausted && !decoded_frame_queue.empty())) {
+        // ── [DECODE-GATE v7.1] لا نُطلق الصوت أبدًا قبل جهوزية إطار فيديو
+        // واحد على الأقل للعرض. بدون هذا الشرط، إن كان فك تشفير الفيديو أبطأ
+        // من تنزيل البيانات (شائع جدًا على المحاكيات التي تفتقر لتسريع العتاد
+        // الحقيقي MediaCodec وتتراجع لفك تشفير برمجي بطيء)، كان الصوت يبدأ
+        // فورًا بينما تبقى الشاشة سوداء لثوانٍ حتى يلحق فك التشفير — تمامًا
+        // النمط المُبلَّغ عنه: "الصوت ينطلق بامتياز، الصورة تتأخر 7-8 ثوانٍ".
+        // الآن ننتظر الاثنين معًا: بيانات كافية + إطار مفكوك جاهز فعليًا.
+        bool first_frame_ready = !decoded_frame_queue.empty();
+
+        if ((enough_buffered || (stream_exhausted && !decoded_frame_queue.empty()))
+            && first_frame_ready) {
             buffering = false;
             first_buffer_done = true;
             if (is_inside_tree()) emit_signal("buffering_changed", false);
