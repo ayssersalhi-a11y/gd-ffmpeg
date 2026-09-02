@@ -2,7 +2,15 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار 7.2 — انطلاق سريع حقيقي: تقليل التخزين الإلزامي من 5s إلى 1s
+ * الإصدار 7.3 — قياس زمني تشخيصي (Timing Diagnostics) — طباعة فقط، بلا تغيير سلوك
+ *
+ * ─── الجديد في v7.3 ──────────────────────────────────────────────────────────
+ *
+ *  [TIMING-DIAG] لتحديد بدقة أين تُصرَف ثواني التأخير الملاحَظة على بعض
+ *        الروابط (مثل خدمات مثل Streamtape التي تتضمن حل رابط عبر توكن)،
+ *        أُضيفت طباعات زمنية نسبية لحظة استدعاء load_video() عند: نجاح فتح
+ *        الاتصال، نجاح تحليل الصيغة، فك أول إطار فيديو، ولحظة الانطلاق
+ *        الفعلية (صوت+صورة معًا). لا تُغيّر أي سلوك — تشخيص فقط.
  *
  * ─── الجديد في v7.2 ──────────────────────────────────────────────────────────
  *
@@ -168,6 +176,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -306,6 +315,17 @@ private:
     std::thread        network_read_thread;
     std::atomic<bool>  network_reader_active{false};
     bool               video_is_network_source = false; // يُضبط في load_video()
+
+    // ── [TIMING-DIAG v7.3] قياس زمني تشخيصي — يطبع فقط، لا يغيّر أي سلوك ──────
+    // يحدد بدقة أين تُصرَف ثواني التأخير: فتح الاتصال؟ تحليل الصيغة؟ أول
+    // إطار مفكوك؟ لحظة الانطلاق الفعلية؟ بدل التخمين.
+    std::chrono::steady_clock::time_point load_start_tp;
+    bool first_frame_decoded_logged = false;
+    bool first_playback_start_logged = false;
+    double _elapsed_ms_since_load() const {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(now - load_start_tp).count();
+    }
 
     std::atomic<bool>   network_seek_requested{false};
     std::atomic<double> network_seek_target_secs{0.0};
