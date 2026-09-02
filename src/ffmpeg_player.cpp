@@ -2,7 +2,16 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 7.2 — انطلاق سريع حقيقي: تقليل التخزين الإلزامي من 5s إلى 1s
+ * الإصدار 7.3 — قياس زمني تشخيصي (Timing Diagnostics) — طباعة فقط، بلا تغيير سلوك
+ *
+ * ─── ما الجديد في v7.3 ────────────────────────────────────────────────────────
+ *
+ * [TIMING-DIAG] لتحديد بدقة أين تُصرَف ثواني التأخير الملاحَظة على بعض
+ *           الروابط (خصوصًا خدمات تتطلب حل رابط عبر توكن مثل Streamtape)،
+ *           أُضيفت طباعات [TIMING] نسبية لحظة استدعاء load_video() عند:
+ *           نجاح avformat_open_input، نجاح avformat_find_stream_info، فك
+ *           أول إطار فيديو، ولحظة الانطلاق الفعلية (صوت+صورة معًا). هذه
+ *           الإضافة تشخيصية بحتة — لا تُغيّر أي سلوك تشغيل فعلي.
  *
  * ─── ما الجديد في v7.2 ────────────────────────────────────────────────────────
  *
@@ -249,7 +258,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.2 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.3 ---");
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
@@ -278,6 +287,11 @@ bool FFmpegPlayer::load_video(const String &path) {
     buffering = false; forward_buffer_secs = 0.0;
     position  = 0.0;   frame_timer         = 0.0;
     _reset_last_audio_pts();
+
+    // [TIMING-DIAG v7.3] نقطة الصفر الزمنية — كل الطوابع اللاحقة نسبية لها
+    load_start_tp = std::chrono::steady_clock::now();
+    first_frame_decoded_logged  = false;
+    first_playback_start_logged = false;
 
     if (path.is_empty()) { _emit_playback_error("Path is empty"); return false; }
 
@@ -379,6 +393,9 @@ void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
         return;
     }
 
+    // [TIMING-DIAG v7.3] وقت فتح الاتصال (TLS/HTTP handshake + أول استجابة)
+    UtilityFunctions::print("[TIMING] avformat_open_input نجح بعد ", _elapsed_ms_since_load(), "ms");
+
     if (avformat_find_stream_info(ctx, nullptr) < 0) {
         avformat_close_input(&ctx);
         pending_video_error_message = "Cannot read stream info: " + path;
@@ -386,6 +403,9 @@ void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
         video_loading_thread_running = false;
         return;
     }
+
+    // [TIMING-DIAG v7.3] وقت تحليل الصيغة (Probing) بالإضافة لما سبقه
+    UtilityFunctions::print("[TIMING] avformat_find_stream_info نجح بعد ", _elapsed_ms_since_load(), "ms");
 
     // تسليم النتيجة للخيط الرئيسي — لا شيء آخر من Godot يُلمَس هنا
     pending_video_fmt_ctx        = ctx;
@@ -398,6 +418,11 @@ void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
 // _process() بعد التقاط نتيجة الخيط الخلفي للفيديو الشبكي). يحتوي كل المنطق
 // الذي كان سابقًا داخل load_video() بعد نجاح avformat_open_input.
 bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_live) {
+    // [TIMING-DIAG v7.3] لحظة استلام الخيط الرئيسي لنتيجة الفتح فعليًا —
+    // يكشف أي فجوة جدولة (لو كان الخيط الرئيسي مشغولًا بشيء آخر قبل أن
+    // يصل لمعالجة video_load_ready في _process())
+    UtilityFunctions::print("[TIMING] الخيط الرئيسي استلم نتيجة الفتح بعد ", _elapsed_ms_since_load(), "ms");
+
     fmt_ctx        = opened_ctx;
     is_live_stream = is_live;
 
@@ -447,6 +472,9 @@ bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_l
     _emit_video_loaded(true);
     UtilityFunctions::print("[LOAD] OK | dur=", duration, "s | fps=", fps,
         " | ", video_width, "x", video_height, " | mix=", godot_mix_rate, "Hz");
+    // [TIMING-DIAG v7.3] وقت جاهزية الكودك بالكامل (بعد فتح مُفكِّك الفيديو،
+    // بما فيها تهيئة MediaCodec إن وُجد تسريع عتاد)
+    UtilityFunctions::print("[TIMING] الكودك جاهز (بما فيه MediaCodec إن وُجد) بعد ", _elapsed_ms_since_load(), "ms");
 
     // ── [THREAD-SAFE v7.0] لمصادر الشبكة: ابدأ خيط القراءة المستمرة المستقل ──
     // من هذه اللحظة فصاعدًا، هذا الخيط هو المالك الحصري لـ fmt_ctx.
@@ -1261,6 +1289,8 @@ void FFmpegPlayer::play() {
     if (!fmt_ctx) {
         if (video_loading_thread_running || video_load_ready) {
             pending_autoplay = true;
+            // [TIMING-DIAG v7.3] play() استُدعيت قبل اكتمال الفتح — تؤجَّل
+            UtilityFunctions::print("[TIMING] play() استُدعيت (مؤجَّلة، الفتح لم يكتمل بعد) عند ", _elapsed_ms_since_load(), "ms");
             return;
         }
         _emit_playback_error("No video loaded"); return;
@@ -1269,6 +1299,8 @@ void FFmpegPlayer::play() {
     _reset_audio_clock(position);
     _reset_last_audio_pts();
     if (is_inside_tree()) emit_signal("buffering_changed", true);
+    // [TIMING-DIAG v7.3] لحظة استدعاء play() الفعلية (فوريًا، الفيديو جاهز)
+    UtilityFunctions::print("[TIMING] play() استُدعيت (فوريًا) عند ", _elapsed_ms_since_load(), "ms");
     UtilityFunctions::print("[PLAY] Buffering...");
 }
 
@@ -1535,6 +1567,12 @@ void FFmpegPlayer::_process(double delta) {
             first_buffer_done = true;
             if (is_inside_tree()) emit_signal("buffering_changed", false);
             _start_audio_at(position);
+
+            // [TIMING-DIAG v7.3] لحظة الانطلاق الفعلية الأولى فقط (صوت+صورة معًا)
+            if (!first_playback_start_logged) {
+                first_playback_start_logged = true;
+                UtilityFunctions::print("[TIMING] الانطلاق الفعلي (صوت+صورة) بعد ", _elapsed_ms_since_load(), "ms");
+            }
         }
         return;
     }
@@ -1824,6 +1862,13 @@ void FFmpegPlayer::_decode_packets_into_queue() {
             df.data.resize(video_width * video_height * 3);
             memcpy(df.data.ptrw(), frame_buffer, df.data.size());
             decoded_frame_queue.push_back(std::move(df));
+
+            // [TIMING-DIAG v7.3] لحظة فك أول إطار فيديو فعليًا (مرة واحدة فقط)
+            if (!first_frame_decoded_logged) {
+                first_frame_decoded_logged = true;
+                UtilityFunctions::print("[TIMING] أول إطار فيديو مفكوك بعد ", _elapsed_ms_since_load(), "ms");
+            }
+
             av_frame_unref(vf); continue;
         }
         if (ret == AVERROR(EAGAIN)) {
