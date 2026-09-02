@@ -147,11 +147,12 @@ jobs:
         id: cache-ffmpeg
         with:
           path: ffmpeg_build
-          # [v5] رُفع الرقم — تغيّرت فعليًا خيارات بناء FFmpeg: تفعيل rtmp/rtsp،
-          # ديكودرز MediaCodec الصريحة، flv/rtsp demuxer، vorbis، وفصل مسار
-          # مخرجات Linux حسب المعمارية. دون رفع الرقم، سيستمر CI باستخدام
-          # الكاش القديم متجاهلاً كل هذه الإصلاحات.
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ matrix.platform }}-${{ matrix.arch }}-v5
+          # [v6] تراجعنا عن إزالة --disable-asm لبناء Linux x86_64 (كسرت
+          # الربط النهائي فعليًا: "relocation ... can not be used when
+          # making a shared object; recompile with -fPIC" على ملفات
+          # Assembly يدوية). أُعيد --disable-asm للجميع. رفع الرقم إلزامي
+          # هنا وإلا سيستمر CI باستخدام الكاش القديم المكسور.
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ matrix.platform }}-${{ matrix.arch }}-v6
 
       # ── 8. بناء FFmpeg (إذا لم يوجد في الكاش) ────────────────────────────────
       - name: Build FFmpeg + OpenSSL for ${{ matrix.platform }} (${{ matrix.arch }})
