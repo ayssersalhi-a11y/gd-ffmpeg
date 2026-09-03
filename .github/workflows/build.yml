@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  GitHub Actions — بناء libgdffmpeg.so (OpenSSL + FFmpeg)                 ║
-# ║  v6 — بنية addons/gdffmpeg صحيحة + إزالة الضغط المزدوج (Double-Zip)      ║
+# ║  GitHub Actions — بناء libgdffmpeg.so (OpenSSL + FFmpeg)                                ║
+# ║  v6 — بنية addons/gdffmpeg صحيحة + إزالة الضغط المزدوج (Double-Zip)                           ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 name: Build libgdffmpeg.so (OpenSSL + FFmpeg)
