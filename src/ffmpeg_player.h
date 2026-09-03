@@ -2,7 +2,15 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار 7.3 — قياس زمني تشخيصي (Timing Diagnostics) — طباعة فقط، بلا تغيير سلوك
+ * الإصدار 7.4 — دعم ترويسة Referer لتفادي تأخير/حجب مضيفي الفيديو المحميين
+ *
+ * ─── الجديد في v7.4 ──────────────────────────────────────────────────────────
+ *
+ *  [REFERER] load_video(path, referer="") — معامل اختياري جديد. بعض مضيفي
+ *        الفيديو (Streamtape وأمثاله) يطبّقون حماية مضادة للاستخدام المباشر
+ *        (Anti-Hotlinking) تتحقق من ترويسة Referer، وقد تتعمّد تأخير
+ *        الاستجابة (لا رفضها صراحة) إن غابت — إجراء شائع مضاد للبوتات. مرّر
+ *        صفحة الفيديو الأصلية كـ Referer عند الحاجة لتفادي هذا التأخير.
  *
  * ─── الجديد في v7.3 ──────────────────────────────────────────────────────────
  *
@@ -205,7 +213,7 @@ public:
     ~FFmpegPlayer();
 
     // ─── Video API ────────────────────────────────────────────────────────────
-    bool load_video(const String &path);
+    bool load_video(const String &path, const String &referer = "");
     void play();
     void pause();
     void stop();
@@ -458,7 +466,7 @@ private:
     void _cleanup_ext_audio();
 
     // [ASYNC-VIDEO v6.3] فتح الفيديو الشبكي في خيط خلفي + إتمام التحميل
-    void _open_video_async_worker(String path, bool is_live);
+    void _open_video_async_worker(String path, bool is_live, String referer);
     bool _finalize_loaded_video(AVFormatContext *opened_ctx, bool is_live);
 
     // [THREAD-SAFE v7.0] خيوط القراءة المستمرة الشبكية (فيديو + صوت خارجي)
