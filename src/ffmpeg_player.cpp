@@ -2,7 +2,15 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 7.3 — قياس زمني تشخيصي (Timing Diagnostics) — طباعة فقط، بلا تغيير سلوك
+ * الإصدار 7.4 — دعم ترويسة Referer لتفادي تأخير/حجب مضيفي الفيديو المحميين
+ *
+ * ─── ما الجديد في v7.4 ────────────────────────────────────────────────────────
+ *
+ * [REFERER] load_video(path, referer="") — معامل اختياري جديد يُمرَّر عبر
+ *           خيار "referer" لـ FFmpeg عند فتح الفيديو الشبكي. بعض مضيفي
+ *           الفيديو (Streamtape وأمثاله) يطبّقون حماية Anti-Hotlinking تتحقق
+ *           من هذه الترويسة، وقد يتعمّد الخادم تأخير الاستجابة (بدل رفضها
+ *           صراحة) إن غابت — إجراء شائع مضاد للبوتات لا يكشف آلية الحماية.
  *
  * ─── ما الجديد في v7.3 ────────────────────────────────────────────────────────
  *
@@ -192,7 +200,7 @@ using namespace godot;
 
 // ─── تسجيل الكلاس ─────────────────────────────────────────────────────────────
 void FFmpegPlayer::_bind_methods() {
-    ClassDB::bind_method(D_METHOD("load_video", "path"),        &FFmpegPlayer::load_video);
+    ClassDB::bind_method(D_METHOD("load_video", "path", "referer"), &FFmpegPlayer::load_video, DEFVAL(""));
     ClassDB::bind_method(D_METHOD("play"),                      &FFmpegPlayer::play);
     ClassDB::bind_method(D_METHOD("pause"),                     &FFmpegPlayer::pause);
     ClassDB::bind_method(D_METHOD("stop"),                      &FFmpegPlayer::stop);
@@ -258,7 +266,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.3 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.4 ---");
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
@@ -282,7 +290,7 @@ void FFmpegPlayer::_ready() {
 // avformat_find_stream_info) يتم الآن في خيط خلفي عبر _open_video_async_worker
 // لمنع تجميد محرك Godot. النتيجة تُفحَص في بداية _process() وتُستكمل هناك عبر
 // _finalize_loaded_video(). الملفات المحلية تبقى متزامنة كما كانت (فتحها سريع).
-bool FFmpegPlayer::load_video(const String &path) {
+bool FFmpegPlayer::load_video(const String &path, const String &referer) {
     _cleanup();
     buffering = false; forward_buffer_secs = 0.0;
     position  = 0.0;   frame_timer         = 0.0;
@@ -324,7 +332,7 @@ bool FFmpegPlayer::load_video(const String &path) {
         pending_video_is_live        = is_live;
         video_loading_thread_running = true;
         video_loading_thread = std::thread(&FFmpegPlayer::_open_video_async_worker,
-                                            this, path, is_live);
+                                            this, path, is_live, referer);
         UtilityFunctions::print("[LOAD] Opening network video asynchronously...");
         return true; // النتيجة الفعلية تصل لاحقًا عبر إشارة video_loaded
     }
@@ -353,7 +361,7 @@ bool FFmpegPlayer::load_video(const String &path) {
 // استدعاء أي دالة من Godot (Node/Signal/Texture/...) من داخلها. فقط عمليات
 // FFmpeg الخام مسموحة هنا. النتيجة تُسلَّم للخيط الرئيسي عبر
 // pending_video_fmt_ctx + الأعلام الذرية (atomic) ليقرأها _process().
-void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
+void FFmpegPlayer::_open_video_async_worker(String path, bool is_live, String referer) {
     AVFormatContext *ctx = nullptr;
     AVDictionary   *opts = nullptr;
     CharString      utf8 = path.utf8();
@@ -374,6 +382,15 @@ void FFmpegPlayer::_open_video_async_worker(String path, bool is_live) {
     av_dict_set(&opts, "rw_timeout",          "15000000", 0);
     // [12] لا reconnect_streamed للملفات المباشرة (غير البث الحي)
     if (is_live) av_dict_set(&opts, "reconnect_streamed", "1", 0);
+
+    // [REFERER v7.4] بعض مضيفي الفيديو (Streamtape وأمثاله) يطبّقون حماية
+    // مضادة للاستخدام المباشر (Anti-Hotlinking) تتحقق من ترويسة Referer قبل
+    // خدمة أي بايت — وقد تتعمّد تأخير الاستجابة بدل رفضها صراحة إن غابت هذه
+    // الترويسة (إجراء شائع مضاد للبوتات). نرسلها فقط إن زوّدنا بها المستدعي.
+    if (!referer.is_empty()) {
+        CharString referer_utf8 = referer.utf8();
+        av_dict_set(&opts, "referer", referer_utf8.get_data(), 0);
+    }
 
     // ── [PROBE-SPEED v6.3] نفس تحسينات تسريع الفتح المستخدمة في الصوت ────────
     // (كانت مفقودة هنا سابقًا رغم وجودها في _open_audio_with_ffmpeg، مما كان
