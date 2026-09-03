@@ -30,9 +30,12 @@ set -e
 # [FIX-8] أُضيف vorbis لـ --enable-decoder — معظم ملفات .ogg الحقيقية هي
 #         Vorbis لا Opus؛ روابط صوت خارجي شبكية بامتداد .ogg (عبر ext_fmt_ctx
 #         في الكود C++) كانت ستفشل بفك التشفير رغم تفعيل Demuxer الحاوية.
-# [FIX-11] أُزيل --disable-asm من بناء Linux x86_64 الأصلي (Native) فقط —
-#          تحسينات SIMD آمنة ومفيدة هنا بعكس حالات Cross-Compile، حيث أُبقي
-#          عليه احتياطًا (Android وLinux ARM64).
+# [FIX-11 — تم التراجع عنه، انظر [REVERT-FIX-11] أدناه] كانت هناك محاولة
+#          لإزالة --disable-asm من بناء Linux x86_64 الأصلي فقط لتحسين
+#          الأداء، لكن ثبت عمليًا (خطأ ربط فعلي على CI) أنها تكسر إنشاء
+#          مكتبة مشتركة (.so) — ملفات Assembly يدوية غير آمنة الموقع رغم
+#          --enable-pic. أُعيد --disable-asm للجميع؛ الاستقرار أهم من مكسب
+#          أداء غير مضمون.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── 1. الإعدادات والمسارات ──────────────────────────────────────────────────
@@ -88,13 +91,19 @@ if [ "$TARGET_PLATFORM" = "linux" ]; then
 	else
 		echo "⚙️  جاري بناء FFmpeg لـ Linux x86_64 مع zlib و fPIC..."
 
-		# [FIX-11] لا حاجة لـ --disable-asm هنا: هذا بناء أصلي (Native) على
-		# نفس معمارية x86_64، فتحسينات SIMD آمنة ومفيدة (أسرع بشكل ملحوظ)
-		# بعكس بعض حالات الـ Cross-Compile حيث أبقينا عليه احتياطًا.
+		# [REVERT-FIX-11 — v2] تراجعنا عن إزالة --disable-asm هنا. التجربة
+		# الفعلية أثبتت أن --enable-pic وحده لا يضمن أن كل ملفات Assembly
+		# اليدوية المحسَّنة (مثل vc1dsp_mmx.o) تُنتِج كودًا آمنًا للموقع
+		# (Position-Independent) فعليًا — الخطأ الفعلي عند الربط النهائي:
+		#   "relocation R_X86_64_PC32 against symbol `ff_pw_9' can not be
+		#    used when making a shared object; recompile with -fPIC"
+		# الاستقرار أهم من مكسب أداء غير مضمون هنا — نُبقي --disable-asm
+		# للجميع (Android وكلا معماريتي Linux) كما كان الوضع الأصلي.
 		./configure \
 			--prefix="${OUTPUT_DIR}" \
 			--enable-static --disable-shared \
 			--disable-programs --disable-doc \
+			--disable-asm \
 			--enable-pic \
 			--enable-zlib \
 			--enable-openssl \
