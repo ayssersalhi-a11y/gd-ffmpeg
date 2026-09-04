@@ -2,7 +2,24 @@
  * ffmpeg_player.cpp
  * GDExtension —FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 7.4 — دعم ترويسة Referer لتفادي تأخير/حجب مضيفي الفيديو المحميين
+ * الإصدار 7.5 — تسخين مُفكِّك MediaCodec مسبقًا (خيط خلفي، مرة واحدة لعمر التطبيق)
+ *
+ * ─── ما الجديد في v7.5 ────────────────────────────────────────────────────────
+ *
+ * [DECODER-WARMUP] السجلات أظهرت فجوة ثابتة تقريبًا (~2.2-2.7 ثانية) بين
+ *           "الكودك جاهز" و"أول إطار مفكوك" — ثابتة بغض النظر عن سرعة
+ *           الشبكة (لوحظت مع اتصال بطيء وسريع على حدٍّ سواء)، مما يرجّح
+ *           أنها تكلفة إنشاء جلسة MediaCodec الحقيقية مع سائق الجهاز
+ *           (AMediaCodec_configure/start)، لا انتظار بيانات شبكية. الآن
+ *           تُفتَح جلسة h264_mediacodec وهمية (1280×720، بلا بيانات فعلية)
+ *           في خيط خلفي منفصل تمامًا (detach) عند _ready() — مرة واحدة فقط
+ *           لعمر التطبيق كله (وليس لكل فيديو) عبر علم ساكن — أثناء الوقت
+ *           "الميت" (تصفّح المستخدم قبل طلب فيديو حقيقي) بدل حدوثها على
+ *           المسار الحرج لأول تشغيل. دالة التسخين ساكنة عمدًا (لا تعتمد
+ *           على this) لتفادي أي خطر مؤشر معلَّق إن أُغلق المشهد أثناءها.
+ *           فشلها آمن تمامًا ولا يؤثر على التشغيل الحقيقي إطلاقًا (سياق
+ *           منفصل يُغلَق فورًا). لا يقين كامل أن هذا يلتقط كامل الفجوة —
+ *           أول محاولة آمنة قبل التفكير بحلول أكثر تعقيدًا وخطورة.
  *
  * ─── ما الجديد في v7.4 ────────────────────────────────────────────────────────
  *
@@ -253,6 +270,60 @@ void FFmpegPlayer::_bind_methods() {
 FFmpegPlayer::FFmpegPlayer() {}
 FFmpegPlayer::~FFmpegPlayer() { _cleanup(); }
 
+// [DECODER-WARMUP v7.5] تعريف العلم الساكن — مرة واحدة فقط لعمر التطبيق كله
+std::atomic<bool> FFmpegPlayer::warmup_done{false};
+
+// ─── [DECODER-WARMUP v7.5] تسخين مُفكِّك MediaCodec بالعتاد مسبقًا ───────────
+// نفتح جلسة h264_mediacodec وهمية بمعاملات افتراضية شائعة (1280×720) دون
+// إطعامها أي بيانات فعلية، ثم نُغلقها فورًا. الهدف: تحفيز إنشاء جلسة
+// MediaCodec الحقيقية مع سائق الجهاز (AMediaCodec_configure/start) — وهي على
+// الأرجح الجزء الأكثر تكلفة زمنيًا (وليس فك بيانات فعلية) — أثناء وقت "ميت"
+// (تصفّح المستخدم قبل طلب فيديو حقيقي) بدل حدوثها على المسار الحرج لأول
+// تشغيل. لا علاقة لهذه الجلسة الوهمية بأي فيديو حقيقي لاحق (يُفتح بمعامﻻته
+// الخاصة بشكل مستقل تمامًا). فشل هذه الدالة بأي شكل آمن تمامًا ولا يؤثر على
+// التشغيل الفعلي إطلاقًا — سياق منفصل يُغلَق فورًا بعد المحاولة.
+//
+// [صدق واجب] لا يوجد يقين كامل أن فتح الجلسة وحده (دون فك إطار حقيقي) يلتقط
+// كامل فجوة الـ ~2.5 ثانية الملاحَظة في السجلات — قد يلتقط جزءًا منها فقط.
+// هذا أول محاولة آمنة قبل التفكير بحلول أكثر تعقيدًا (تضمين بايتات H.264
+// حقيقية لفك إطار وهمي كامل)، والتي تحمل مخاطر توافق حقيقية غير مؤكَّدة.
+void FFmpegPlayer::_decoder_warmup_worker() {
+    auto t0 = std::chrono::steady_clock::now();
+    UtilityFunctions::print("[WARMUP] بدء تسخين مُفكِّك الفيديو بالعتاد (خلفية، مرة واحدة لعمر التطبيق)...");
+
+    const AVCodec *vc = avcodec_find_decoder_by_name("h264_mediacodec");
+    if (!vc) {
+        UtilityFunctions::print("[WARMUP] h264_mediacodec غير متوفر في هذا البناء — تخطي التسخين.");
+        return;
+    }
+
+    AVCodecContext *ctx = avcodec_alloc_context3(vc);
+    if (!ctx) {
+        UtilityFunctions::print("[WARMUP] فشل تخصيص سياق الكودك — تخطي.");
+        return;
+    }
+
+    // معاملات افتراضية شائعة فقط لتحفيز إنشاء الجلسة — غير مرتبطة بأي فيديو حقيقي
+    ctx->width   = 1280;
+    ctx->height  = 720;
+    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    int ret = avcodec_open2(ctx, vc, nullptr);
+    double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    if (ret < 0) {
+        char err_buf[256];
+        av_strerror(ret, err_buf, sizeof(err_buf));
+        UtilityFunctions::print("[WARMUP] فشل فتح جلسة التسخين (", String(err_buf),
+            ") بعد ", ms, "ms — لا يؤثر على التشغيل الفعلي لاحقًا.");
+    } else {
+        UtilityFunctions::print("[WARMUP] جلسة MediaCodec سُخِّنت بنجاح خلال ", ms, "ms");
+    }
+
+    avcodec_free_context(&ctx);
+}
+
 // ─── _ready ───────────────────────────────────────────────────────────────────
 void FFmpegPlayer::_ready() {
     godot_mix_rate = (int)AudioServer::get_singleton()->get_mix_rate();
@@ -266,7 +337,14 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.4 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.5 ---");
+
+    // [DECODER-WARMUP v7.5] مرة واحدة فقط لعمر التطبيق — دالة ساكنة، خيط
+    // منفصل (detach) بلا أي ارتباط بـ this، فلا خطر مؤشر معلَّق إن أُغلق
+    // المشهد قبل انتهاء التسخين.
+    if (!warmup_done.exchange(true)) {
+        std::thread(&FFmpegPlayer::_decoder_warmup_worker).detach();
+    }
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
     {
