@@ -1,189 +1,10 @@
 /**
  * ffmpeg_player.cpp
- * GDExtension —FFmpeg Video Player (Unified) for Godot 4
+ * GDExtension — FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار 7.5 — تسخين مُفكِّك MediaCodec مسبقًا (خيط خلفي، مرة واحدة لعمر التطبيق)
- *
- * ─── ما الجديد في v7.5 ────────────────────────────────────────────────────────
- *
- * [DECODER-WARMUP] السجلات أظهرت فجوة ثابتة تقريبًا (~2.2-2.7 ثانية) بين
- *           "الكودك جاهز" و"أول إطار مفكوك" — ثابتة بغض النظر عن سرعة
- *           الشبكة (لوحظت مع اتصال بطيء وسريع على حدٍّ سواء)، مما يرجّح
- *           أنها تكلفة إنشاء جلسة MediaCodec الحقيقية مع سائق الجهاز
- *           (AMediaCodec_configure/start)، لا انتظار بيانات شبكية. الآن
- *           تُفتَح جلسة h264_mediacodec وهمية (1280×720، بلا بيانات فعلية)
- *           في خيط خلفي منفصل تمامًا (detach) عند _ready() — مرة واحدة فقط
- *           لعمر التطبيق كله (وليس لكل فيديو) عبر علم ساكن — أثناء الوقت
- *           "الميت" (تصفّح المستخدم قبل طلب فيديو حقيقي) بدل حدوثها على
- *           المسار الحرج لأول تشغيل. دالة التسخين ساكنة عمدًا (لا تعتمد
- *           على this) لتفادي أي خطر مؤشر معلَّق إن أُغلق المشهد أثناءها.
- *           فشلها آمن تمامًا ولا يؤثر على التشغيل الحقيقي إطلاقًا (سياق
- *           منفصل يُغلَق فورًا). لا يقين كامل أن هذا يلتقط كامل الفجوة —
- *           أول محاولة آمنة قبل التفكير بحلول أكثر تعقيدًا وخطورة.
- *
- * ─── ما الجديد في v7.4 ────────────────────────────────────────────────────────
- *
- * [REFERER] load_video(path, referer="") — معامل اختياري جديد يُمرَّر عبر
- *           خيار "referer" لـ FFmpeg عند فتح الفيديو الشبكي. بعض مضيفي
- *           الفيديو (Streamtape وأمثاله) يطبّقون حماية Anti-Hotlinking تتحقق
- *           من هذه الترويسة، وقد يتعمّد الخادم تأخير الاستجابة (بدل رفضها
- *           صراحة) إن غابت — إجراء شائع مضاد للبوتات لا يكشف آلية الحماية.
- *
- * ─── ما الجديد في v7.3 ────────────────────────────────────────────────────────
- *
- * [TIMING-DIAG] لتحديد بدقة أين تُصرَف ثواني التأخير الملاحَظة على بعض
- *           الروابط (خصوصًا خدمات تتطلب حل رابط عبر توكن مثل Streamtape)،
- *           أُضيفت طباعات [TIMING] نسبية لحظة استدعاء load_video() عند:
- *           نجاح avformat_open_input، نجاح avformat_find_stream_info، فك
- *           أول إطار فيديو، ولحظة الانطلاق الفعلية (صوت+صورة معًا). هذه
- *           الإضافة تشخيصية بحتة — لا تُغيّر أي سلوك تشغيل فعلي.
- *
- * ─── ما الجديد في v7.2 ────────────────────────────────────────────────────────
- *
- * [STARTUP-FIX] INITIAL_PLAY كان 5.0 ثانية — انتظار إلزامي طويل قبل أي
- *           انطلاق بصرف النظر عن جودة الشبكة الفعلية، حتى لو كانت ممتازة
- *           وقادرة على تحميل 5 ثوانٍ فورًا. هذا قرار تصميم صارم اتُّخذ في
- *           v6.4 لحل مشكلة التقطّع على الشبكات الضعيفة، لكنه ضحّى بسرعة
- *           الانطلاق للجميع مقابل ذلك. التطبيقات الاحترافية (يوتيوب، تيك
- *           توك) تنطلق بجزء من ثانية إلى ثانية واحدة فقط، وتعتمد على إعادة
- *           التخزين التفاعلية (موجودة عندنا أصلًا وتعمل جيدًا) للتعامل مع
- *           أي تعثّر أثناء التشغيل بدل انتظار مسبق ضخم. أصبح الآن 1.0 ثانية
- *           فقط. REBUFFER_TARGET (2s) بقي كما هو لإعادة التخزين بعد نضوب
- *           فعلي أثناء التشغيل، بهامش أكبر قليلًا عن قصد (النضوب دليل شبكة
- *           متعثرة بالفعل، فالحذر الإضافي هناك مبرَّر).
- *
- * ─── ما الجديد في v7.1 ────────────────────────────────────────────────────────
- *
- * [DECODE-GATE] كان الخروج من buffering يعتمد فقط على توفر بيانات كافية
- *           (forward_buffer_secs)، فيُطلَق الصوت فورًا حتى لو لم يُفكَّ أي
- *           إطار فيديو بعد. هذا يظهر بوضوح على الأجهزة/المحاكيات ذات فك
- *           التشفير البرمجي البطيء (بلا تسريع عتاد MediaCodec فعلي): الصوت
- *           يبدأ ممتازًا فورًا، بينما تبقى الشاشة سوداء لثوانٍ (شوهد حتى
- *           7-8 ثوانٍ في بعض المحاكيات) حتى يلحق فك التشفير بموضع الصوت.
- *           الآن لا نخرج من buffering ولا نُشغِّل الصوت إلا بعد جهوزية إطار
- *           مفكوك واحد فعليًا على الأقل (decoded_frame_queue غير فارغ)،
- *           فينطلق الصوت والصورة معًا دائمًا مهما بلغت سرعة فك التشفير —
- *           قد يطول وقت الانتظار الكلي قليلًا على الأجهزة البطيئة، لكن لن
- *           يظهر صوت بلا صورة مرة أخرى.
- *
- * ─── ما الجديد في v7.0 ────────────────────────────────────────────────────────
- *
- * [THREAD-SAFE-NETWORK] القراءة المستمرة (av_read_frame) والـ Seek
- *           (av_seek_frame) كانا يُنفَّذان على الخيط الرئيسي لكل من fmt_ctx
- *           (الفيديو) و ext_fmt_ctx (الصوت الخارجي الشبكي). إن تجمّد الاتصال
- *           (Socket مفتوح لكن بلا بيانات ولا خطأ صريح) كان هذا يُجمّد محرك
- *           Godot بالكامل لمدة غير محدودة — بعكس ما قد يظنه المرء من أن خيار
- *           "reconnect" وحده كافٍ. الآن لكل منهما خيط خلفي مستقل تمامًا
- *           (_network_read_worker / _ext_network_read_worker) يملك سياقه
- *           الخاص حصريًا بعد فتحه؛ الخيط الرئيسي لا يستدعي أي av_read_frame
- *           أو av_seek_frame عليهما إطلاقًا بعد ذلك — فقط يقرأ من طوابير
- *           محمية بـ std::mutex يملؤها هذان الخيطان الخلفيان باستمرار.
- *           عمليات الـ Seek على مصدر شبكي أصبحت طلبات ذرية (atomic) غير
- *           حاجبة (network_seek_requested) يعالجها كل خيط بنفسه في دَوره،
- *           والخيط الرئيسي يتابع الحالة عبر إشارة إتمام (network_seek_done)
- *           في _process() دون أي انتظار حاجب.
- *
- * [TIMEOUT] أُضيف timeout/rw_timeout (15 ثانية) لفتح الفيديو الشبكي (كان
- *           موجودًا مسبقًا فقط لفتح الصوت الخارجي)، فيحدّ أقصى مدة انتظار
- *           لأي استدعاء قراءة منفرد حتى داخل الخيط الخلفي نفسه — يضمن ألا
- *           يُحتجَز أي خيط إلى الأبد على اتصال ميت تمامًا بلا خطأ صريح، وأن
- *           إغلاق الخيط لاحقًا (عند تحميل فيديو جديد أو الخروج) لا ينتظر
- *           أكثر من هذه المهلة كحد أقصى.
- *
- * ─── ما الجديد في v6.5 ────────────────────────────────────────────────────────
- *
- * [AV-SYNC] عند استخدام صوت خارجي محلي (res://, user://, .mp3/.ogg) لا يوجد
- *           سابقًا أي مراقبة نشطة للتزامن — موضع الفيديو كان يتقدّم بالزمن
- *           الفعلي (position += delta) بلا أي مقارنة مع الموضع الحقيقي لمشغّل
- *           الصوت. الآن نقارن كل ثانية بين position والموضع الفعلي المُبلَّغ
- *           من AudioStreamPlayer::get_playback_position():
- *             • فرق < 0.15s  → طبيعي، لا إجراء.
- *             • فرق 0.15–0.75s → تصحيح صامت (نُطابق موضع الفيديو مع الصوت).
- *             • فرق >= 0.75s  → تصحيح + إطلاق إشارة av_sync_issue لإعلام
- *               الواجهة/المستخدم أن التزامن قد يكون تأثر.
- *           (لا حاجة لهذا مع الصوت المدمج/الشبكي لأن موضع الفيديو هناك
- *           مُشتَق حرفيًا من ساعة الصوت الفعلية — لا انجراف ممكن أصلاً).
- *
- * ─── ما الجديد في v6.4 ────────────────────────────────────────────────────────
- *
- * [BUFFER-FIX] شرط الخروج من buffering كان يحتوي "|| !decoded_frame_queue.empty()"
- *           وبما أن أول إطار يُفكّ خلال أول Tick تقريبًا، كان هذا يُخرِج من
- *           التخزين فورًا بغض النظر عن forward_buffer_secs الفعلي — فلا ينتظر
- *           أبدًا الـ 5 ثوانٍ المطلوبة (INITIAL_PLAY) على شبكة ضعيفة. النتيجة:
- *           انطلاق فوري بجزء من الثانية من البيانات، نضوب سريع، إعادة دخول
- *           buffering، وخروج فوري مجددًا لنفس السبب → تقطّع متكرر (نصف ثانية
- *           تشغيل / ربع ثانية توقف). الآن الشرط يعتمد حصرًا على
- *           forward_buffer_secs (أو نفاد المصدر بالكامل EOF)، مع هدف أقصر
- *           (REBUFFER_TARGET=2s) لإعادة التخزين بعد أول انطلاق ناجح بدل
- *           إعادة انتظار 5 ثوانٍ في كل مرة (first_buffer_done).
- *
- * [STATUS-FIX] إشارة buffering_status (المغذّية لشريط التحميل في الواجهة) كانت
- *           لا تصل إطلاقًا أثناء buffering=true بسبب "return" مبكر في _process()
- *           قبل كود الإشارة. نُقل حساب/إطلاق هذه الإشارة إلى بداية _process()
- *           بحيث يعمل بغضّ النظر عن حالة buffering، فيعرض شريط التحميل التقدّم
- *           الحقيقي أثناء الانتظار الفعلي بدل القفز المفاجئ.
- *
- * ─── ما الجديد في v6.3 ────────────────────────────────────────────────────────
- *
- * [ASYNC-VIDEO] فتح الفيديو الشبكي (avformat_open_input +
- *           avformat_find_stream_info) كان يُنفَّذ بشكل متزامن على الخيط
- *           الرئيسي داخل load_video()، مما يُجمّد محرك Godot بالكامل لثوانٍ
- *           عند التشغيل من الإنترنت (يظهر كشاشة سوداء + توقف الواجهة تمامًا).
- *           الآن يتم تنفيذ هذا الفتح في std::thread خلفي منفصل (بنفس نمط
- *           _open_audio_async_worker المستخدم أصلاً للصوت الشبكي)، وتُسلَّم
- *           النتيجة (نجاح/فشل) للخيط الرئيسي عبر أعلام atomic تُفحَص في
- *           بداية _process() قبل أي شيء آخر.
- *
- * [PROBE-SPEED] إضافة probesize=512KB و analyzeduration=2s لفتح الفيديو
- *           الشبكي — لم تكونا مضبوطتين هنا رغم استخدامهما فعليًا في فتح
- *           الصوت الخارجي (_open_audio_with_ffmpeg)، مما كان يجعل تحليل
- *           الستريم (avformat_find_stream_info) يأخذ وقتًا أطول من اللازم
- *           باستخدام القيم الافتراضية الأكبر لـ FFmpeg.
- *
- * ─── ما الجديد في v6.2 ────────────────────────────────────────────────────────
- *
- * [EOF-FIX] استبدال شرط "position >= duration" (الذي كان لا يتحقق أبدًا بسبب
- *           GPU_LATENCY_OFFSET السالب) باكتشاف EOF حقيقي من الديموكسر عبر
- *           av_read_frame() == AVERROR_EOF + تفريغ كل الطوابير (فيديو/صوت،
- *           داخلي/خارجي) قبل إطلاق video_finished.
- *
- * [AUDIO-FALLBACK] الصوت المدمج مع الفيديو يُشغَّل تلقائيًا وفوريًا (محليًا
- *           كان الفيديو أو رابط شبكة). إذا استُدعيت load_audio() برابط صوت
- *           خارجي صالح، يتم التبديل السلس إليه فور جاهزيته (بلا فجوة صمت)
- *           ويتوقف الصوت الداخلي تلقائيًا. إذا فشل تحميل الخارجي أو لم يُطلب
- *           إطلاقًا، يستمر الصوت الداخلي المدمج كخيار افتراضي/احتياطي دائم.
- *
- * ─── ما الجديد في v6.1 ───────────────────────────────────────────────────────
- *
- * [FIX-1] seekable=0 بدلاً من seekable=1 في _open_audio_with_ffmpeg:
- *         seekable=1 كان يجبر FFmpeg على تجربة Range-Requests أثناء الـ Probe،
- *         إذا رفض الخادم → AVERROR_INVALIDDATA (-1094995529). الآن نستخدم
- *         وضع Streaming النقي (seekable=0) الذي يقرأ تسلسلياً بلا Seek.
- *
- * [FIX-2] إصلاح منطق load_audio() — كان يرفض صامتاً روابط HTTP/HTTPS
- *         إذا كان الفيديو محلياً (use_external_audio=false). الآن يُتحقق
- *         من مسار الصوت نفسه بشكل مستقل عن مصدر الفيديو (ومنذ v6.2 أصبح
- *         مستقلاً تمامًا عن نوع الفيديو في كل الحالات).
- *
- * [FIX-3] تشخيص بناء المكتبة في _ready():
- *         طباعة جميع البروتوكولات المتاحة (avio_enum_protocols) لتأكيد
- *         وجود tls/https/ssl في هذا الـ Build على الأندرويد.
- *
- * [FIX-4] تحسينات إضافية لـ _open_audio_with_ffmpeg:
- *         - إضافة ssl للـ protocol_whitelist.
- *         - User-Agent أندرويد (بدلاً من Windows).
- *         - reconnect=1 + reconnect_delay_max=5.
- *         - probesize=512KB + analyzeduration=2s لتسريع الفتح.
- *
- * ─── الإصدارات السابقة ────────────────────────────────────────────────────────
- *
- * [6]  Audio Overrun Protection (v6.0)
- * [7]  Audio Auto-Recovery (v6.0)
- * [8]  Audio Interpolation & Soft Clipping (v6.0)
- * [9]  Silence Filling (v6.0)
- * [10] Smart Channel Mapping (v6.0)
- * [11] Hard Frame Drop + GPU Latency Offset (v6.0)
- * [12] إصلاح أولي لروابط HTTP/HTTPS (v6.0 — مكتمل في v6.1)
+ * الإصدار الحالي: 7.5.1
+ * سجل التغييرات الكامل (كل إصدار وسببه): راجع CHANGELOG_ffmpeg_player.md
+ * بجانب هذا الملف — لا تُضِف تاريخ إصدارات هنا، فقط الكود.
  */
 
 #include "ffmpeg_player.h"
@@ -270,10 +91,10 @@ void FFmpegPlayer::_bind_methods() {
 FFmpegPlayer::FFmpegPlayer() {}
 FFmpegPlayer::~FFmpegPlayer() { _cleanup(); }
 
-// [DECODER-WARMUP v7.5] تعريف العلم الساكن — مرة واحدة فقط لعمر التطبيق كله
+// [DECODER-WARMUP v7.5.1] تعريف العلم الساكن — مرة واحدة فقط لعمر التطبيق كله
 std::atomic<bool> FFmpegPlayer::warmup_done{false};
 
-// ─── [DECODER-WARMUP v7.5] تسخين مُفكِّك MediaCodec بالعتاد مسبقًا ───────────
+// ─── [DECODER-WARMUP v7.5.1] تسخين مُفكِّك MediaCodec بالعتاد مسبقًا ───────────
 // نفتح جلسة h264_mediacodec وهمية بمعاملات افتراضية شائعة (1280×720) دون
 // إطعامها أي بيانات فعلية، ثم نُغلقها فورًا. الهدف: تحفيز إنشاء جلسة
 // MediaCodec الحقيقية مع سائق الجهاز (AMediaCodec_configure/start) — وهي على
@@ -283,13 +104,21 @@ std::atomic<bool> FFmpegPlayer::warmup_done{false};
 // الخاصة بشكل مستقل تمامًا). فشل هذه الدالة بأي شكل آمن تمامًا ولا يؤثر على
 // التشغيل الفعلي إطلاقًا — سياق منفصل يُغلَق فورًا بعد المحاولة.
 //
+// [v7.5.1 — مهم] تُستدعى الآن من الخيط الرئيسي مباشرة (وليس خيط منفصل).
+// السبب: MediaCodec يحتاج بيئة JNI مرتبطة (Java VM) لأي عملية داخلية، وهذا
+// متوفر تلقائيًا للخيط الرئيسي عبر إطار عمل Android/Godot، لكن أي std::thread
+// خام ننشئه يدويًا لا يملك هذا الارتباط إطلاقًا — كان هذا يسبب فشل التسخين
+// الدائم بخطأ "Operation not permitted" في v7.5. التكلفة الزمنية لهذا
+// الاستدعاء المتزامن صغيرة نسبيًا ومرة واحدة فقط لعمر التطبيق (وليس لكل
+// فيديو)، وهي مقايضة مقبولة مقابل ضمان عمل الميزة فعليًا.
+//
 // [صدق واجب] لا يوجد يقين كامل أن فتح الجلسة وحده (دون فك إطار حقيقي) يلتقط
-// كامل فجوة الـ ~2.5 ثانية الملاحَظة في السجلات — قد يلتقط جزءًا منها فقط.
-// هذا أول محاولة آمنة قبل التفكير بحلول أكثر تعقيدًا (تضمين بايتات H.264
-// حقيقية لفك إطار وهمي كامل)، والتي تحمل مخاطر توافق حقيقية غير مؤكَّدة.
+// كامل فجوة "الكودك جاهز ← أول إطار" الملاحَظة في السجلات — تبيّن لاحقًا أن
+// هذه الفجوة نفسها متذبذبة جدًا بين التجارب (450ms إلى 12+ ثانية)، فقد لا
+// تكون تكلفة MediaCodec ثابتة كما افتُرض ابتداءً. راجع CHANGELOG للتفاصيل.
 void FFmpegPlayer::_decoder_warmup_worker() {
     auto t0 = std::chrono::steady_clock::now();
-    UtilityFunctions::print("[WARMUP] بدء تسخين مُفكِّك الفيديو بالعتاد (خلفية، مرة واحدة لعمر التطبيق)...");
+    UtilityFunctions::print("[WARMUP] بدء تسخين مُفكِّك الفيديو بالعتاد (على الخيط الرئيسي، مرة واحدة لعمر التطبيق)...");
 
     const AVCodec *vc = avcodec_find_decoder_by_name("h264_mediacodec");
     if (!vc) {
@@ -337,13 +166,17 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.5 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.5.1 ---");
 
-    // [DECODER-WARMUP v7.5] مرة واحدة فقط لعمر التطبيق — دالة ساكنة، خيط
-    // منفصل (detach) بلا أي ارتباط بـ this، فلا خطر مؤشر معلَّق إن أُغلق
-    // المشهد قبل انتهاء التسخين.
+    // [DECODER-WARMUP-JNI-FIX v7.5.1] تصحيح جوهري: خيط std::thread خام غير
+    // مرتبط ببيئة JNI الخاصة بأندرويد التي يحتاجها MediaCodec داخليًا —
+    // كان هذا يسبب فشل التسخين دائمًا بخطأ "Operation not permitted" (انظر
+    // CHANGELOG_ffmpeg_player.md لتفاصيل التشخيص). الخيط الرئيسي لـ Godot
+    // مرتبط بـ JNI تلقائيًا من إطار العمل نفسه، لذا ننفّذ التسخين هنا
+    // متزامنًا (وليس في خيط منفصل) — تكلفته صغيرة ومرة واحدة فقط لعمر
+    // التطبيق كله، وهذا أفضل من ميزة "غير حاجبة" لكنها معطوبة دائمًا.
     if (!warmup_done.exchange(true)) {
-        std::thread(&FFmpegPlayer::_decoder_warmup_worker).detach();
+        _decoder_warmup_worker();
     }
 
     // ── تشخيص: طباعة البروتوكولات المتاحة في هذا الـ Build ──────────────────
@@ -590,6 +423,14 @@ bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_l
 void FFmpegPlayer::_network_read_worker() {
     AVPacket *pk = av_packet_alloc();
 
+    // [BUFFER-OSCILLATION-DIAG v7.5.1] عدّاد وتوقيت لطباعة معدّل إنتاج
+    // الحزم الفعلي (كم حزمة فيديو وصلت خلال آخر ~0.5 ثانية) — يُقارَن مع
+    // [BUF-DIAG] المطبوعة من _update_buffer_stats() على الخيط الرئيسي
+    // لتحديد إن كان التذبذب سببه بطء الشبكة (إنتاج قليل) أو بطء استهلاك
+    // فك التشفير (إنتاج جيد لكن الطابور لا يُستهلَك بنفس السرعة).
+    int video_pkts_since_last_print = 0;
+    auto diag_last_print = std::chrono::steady_clock::now();
+
     while (network_reader_active) {
         // ── معالجة طلب Seek (نحن المالك الحصري لـ fmt_ctx، آمن تمامًا) ───────
         if (network_seek_requested) {
@@ -644,12 +485,25 @@ void FFmpegPlayer::_network_read_worker() {
             (!use_external_audio && pk->stream_index == audio_stream_idx)) {
             AVPacket *clone = av_packet_clone(pk);
             std::lock_guard<std::mutex> lock(network_queue_mutex);
-            if (pk->stream_index == video_stream_idx)
+            if (pk->stream_index == video_stream_idx) {
                 video_packet_queue.push_back(clone);
-            else
+                video_pkts_since_last_print++;
+            } else
                 audio_packet_queue.push_back(clone);
         }
         av_packet_unref(pk);
+
+        // [BUFFER-OSCILLATION-DIAG v7.5.1] طباعة مُهدَّأة لمعدّل إنتاج حزم
+        // الفيديو الفعلي من الشبكة
+        auto diag_now = std::chrono::steady_clock::now();
+        double diag_elapsed = std::chrono::duration<double>(diag_now - diag_last_print).count();
+        if (diag_elapsed >= 0.5) {
+            UtilityFunctions::print("[NET-DIAG] حزم فيديو واردة آخر ", diag_elapsed,
+                "s: ", video_pkts_since_last_print,
+                " (~", (double)video_pkts_since_last_print / diag_elapsed, " حزمة/ث)");
+            video_pkts_since_last_print = 0;
+            diag_last_print = diag_now;
+        }
     }
 
     av_packet_free(&pk);
@@ -1814,14 +1668,47 @@ void FFmpegPlayer::_update_buffer_stats() {
     double vstart = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
                     ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
 
-    std::lock_guard<std::mutex> lock(network_queue_mutex);
-    if (video_packet_queue.empty())
-        forward_buffer_secs = decoded_frame_queue.empty() ? 0.0
-            : Math::max(0.0, decoded_frame_queue.back().pts - position);
-    else {
-        AVPacket *last = video_packet_queue.back();
-        if (last->pts != AV_NOPTS_VALUE)
-            forward_buffer_secs = Math::max(0.0, (last->pts * tb) - vstart - position);
+    // [BUFFER-OSCILLATION-DIAG v7.5.1] متغيرات تشخيصية فقط — لا تؤثر على أي
+    // منطق فعلي، تُستخدم أدناه فقط للطباعة المُهدَّأة.
+    int    diag_pkt_queue_size = 0;
+    String diag_branch         = "?";
+    double diag_last_pkt_time  = -1.0;
+
+    {
+        std::lock_guard<std::mutex> lock(network_queue_mutex);
+        diag_pkt_queue_size = (int)video_packet_queue.size();
+
+        if (video_packet_queue.empty()) {
+            diag_branch = "decoded_frame_queue (packet_queue فارغ)";
+            forward_buffer_secs = decoded_frame_queue.empty() ? 0.0
+                : Math::max(0.0, decoded_frame_queue.back().pts - position);
+        } else {
+            diag_branch = "video_packet_queue (آخر حزمة)";
+            AVPacket *last = video_packet_queue.back();
+            if (last->pts != AV_NOPTS_VALUE) {
+                diag_last_pkt_time = (last->pts * tb) - vstart;
+                forward_buffer_secs = Math::max(0.0, diag_last_pkt_time - position);
+            }
+        }
+    }
+
+    // [BUFFER-OSCILLATION-DIAG v7.5.1] طباعة مُهدَّأة (كل ~0.5 ثانية) تكشف
+    // الحالة الداخلية الفعلية للطوابير لحظة كل حساب — تفسّر أي قفزة/سقوط
+    // مفاجئ في forward_buffer_secs (High/Stored) المعروض عبر buffering_status.
+    // مثال: إن قفز video_pkt_q من عدد كبير لـ 0 بين طباعتين متتاليتين بينما
+    // decoded_frame_q ظل صغيرًا، فهذا يعني أن فك التشفير أبطأ من استهلاك
+    // الطابور، وليس نضوب شبكة حقيقي.
+    static std::chrono::steady_clock::time_point diag_last_print{};
+    auto diag_now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(diag_now - diag_last_print).count() >= 0.5) {
+        diag_last_print = diag_now;
+        UtilityFunctions::print("[BUF-DIAG] video_pkt_q=", diag_pkt_queue_size,
+            " | decoded_frame_q=", (int)decoded_frame_queue.size(),
+            " | المصدر=", diag_branch,
+            " | آخر_وقت_حزمة=", diag_last_pkt_time,
+            " | position=", position,
+            " | fwd=", forward_buffer_secs,
+            " | eof=", demux_eof_reached ? "نعم" : "لا");
     }
 }
 
