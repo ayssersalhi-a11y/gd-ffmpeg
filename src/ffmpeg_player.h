@@ -2,7 +2,7 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار الحالي: 7.5.1
+ * الإصدار الحالي: 7.6
  * سجل التغييرات الكامل (كل إصدار وسببه): راجع CHANGELOG_ffmpeg_player.md
  * بجانب هذا الملف — لا تُضِف تاريخ إصدارات هنا، فقط الكود.
  */
@@ -176,8 +176,8 @@ private:
     // يحدد بدقة أين تُصرَف ثواني التأخير: فتح الاتصال؟ تحليل الصيغة؟ أول
     // إطار مفكوك؟ لحظة الانطلاق الفعلية؟ بدل التخمين.
     std::chrono::steady_clock::time_point load_start_tp;
-    bool first_frame_decoded_logged = false;
-    bool first_playback_start_logged = false;
+    std::atomic<bool> first_frame_decoded_logged{false}; // [DECODE-THREAD v7.6] قد يُكتب من خيط الفك الآن
+    bool first_playback_start_logged = false; // يبقى main-thread-only
     double _elapsed_ms_since_load() const {
         auto now = std::chrono::steady_clock::now();
         return std::chrono::duration<double, std::milli>(now - load_start_tp).count();
@@ -202,6 +202,25 @@ private:
     std::atomic<bool>   ext_network_seek_requested{false};
     std::atomic<double> ext_network_seek_target_secs{0.0};
     std::atomic<bool>  ext_network_read_error_flag{false};
+
+    // ── [DECODE-THREAD v7.6] خيط فك تشفير مستقل — للفيديو الشبكي فقط ─────────
+    // نطاق مقصود وضيّق: يعالج تحديدًا مشكلة "عمق أنبوب MediaCodec" (بعض
+    // الأجهزة تحتاج ~100-140 حزمة قبل إخراج أول إطار) — الفيديو المحلي لا
+    // يعاني هذه المشكلة (سريع أصلاً)، فيبقى على مساره القديم دون تغيير.
+    // هذا الخيط هو المالك الحصري لـ video_codec_ctx/sws_ctx بمجرد بدئه —
+    // الخيط الرئيسي لا يستدعي avcodec_send_packet/receive_frame/flush_buffers
+    // عليهما إطلاقًا طوال عمل هذا الخيط.
+    std::thread        decode_thread;
+    std::atomic<bool>  decode_thread_active{false};
+    std::mutex         decoded_frame_mutex; // يحمي decoded_frame_queue فقط
+
+    std::atomic<bool>  decode_flush_requested{false}; // طلب تفريغ من seek()
+    std::atomic<bool>  decode_flush_done{false};
+    // نسخة ذرية آمنة من position يقرأها خيط الفك (بدل قراءة position مباشرة
+    // من خيط آخر، وهو متغيّر double عادي غير آمن للقراءة/الكتابة المتزامنة)
+    std::atomic<double> decode_position_hint{0.0};
+
+    void _decode_thread_worker();
 
     static const int MAX_DECODED_FRAMES = 8;
     static const int MAX_AUDIO_FRAMES   = 32;
@@ -337,7 +356,7 @@ private:
     void _update_buffer_stats();
     int  _calc_read_batch_size() const;
 
-    void _decode_packets_into_queue();
+    void _decode_packets_into_queue(bool greedy = false);
     void _decode_audio_into_queue();
     void _decode_ext_audio_into_queue();
 
