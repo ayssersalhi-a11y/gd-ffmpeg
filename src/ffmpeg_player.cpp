@@ -2,7 +2,7 @@
  * ffmpeg_player.cpp
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار الحالي: 7.5.1
+ * الإصدار الحالي: 7.6
  * سجل التغييرات الكامل (كل إصدار وسببه): راجع CHANGELOG_ffmpeg_player.md
  * بجانب هذا الملف — لا تُضِف تاريخ إصدارات هنا، فقط الكود.
  */
@@ -166,7 +166,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.5.1 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.6 ---");
 
     // [DECODER-WARMUP-JNI-FIX v7.5.1] تصحيح جوهري: خيط std::thread خام غير
     // مرتبط ببيئة JNI الخاصة بأندرويد التي يحتاجها MediaCodec داخليًا —
@@ -410,6 +410,15 @@ bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_l
         network_reader_active = true;
         network_read_thread = std::thread(&FFmpegPlayer::_network_read_worker, this);
         UtilityFunctions::print("[NET-READ] Background network reader thread started.");
+
+        // [DECODE-THREAD v7.6] وخيط فك تشفير مستقل — من هذه اللحظة فصاعدًا
+        // هذا الخيط هو المالك الحصري لـ video_codec_ctx/sws_ctx.
+        decode_thread_active = true;
+        decode_flush_requested = false;
+        decode_flush_done      = false;
+        decode_position_hint   = position;
+        decode_thread = std::thread(&FFmpegPlayer::_decode_thread_worker, this);
+        UtilityFunctions::print("[DECODE-THREAD] Background decode thread started.");
     }
     return true;
 }
@@ -507,6 +516,103 @@ void FFmpegPlayer::_network_read_worker() {
     }
 
     av_packet_free(&pk);
+}
+
+// ─── [DECODE-THREAD v7.6] خيط فك تشفير مستقل — للفيديو الشبكي فقط ───────────
+// المالك الحصري لـ video_codec_ctx/sws_ctx بمجرد بدء هذا الخيط. يسحب حزمًا
+// من video_packet_queue (نفس الطابور الذي يملؤه _network_read_worker) بأقصى
+// سرعة ممكنة — لا يوجد سبب للتقييد هنا؛ إن لم توجد حزمة، ننام قليلًا فقط.
+// هذا يحل مشكلة "عمق أنبوب MediaCodec" (بعض الأجهزة تحتاج ~100-140 حزمة
+// قبل إخراج أول إطار) دون انتظار دورها ضمن معدل إطارات Godot في _process().
+void FFmpegPlayer::_decode_thread_worker() {
+    AVFrame *vf = av_frame_alloc();
+
+    while (decode_thread_active) {
+        // ── معالجة طلب تفريغ من seek() (نحن المالك الحصري لـ video_codec_ctx) ──
+        if (decode_flush_requested) {
+            if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
+            {
+                std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+                decoded_frame_queue.clear();
+            }
+            decode_flush_requested = false;
+            decode_flush_done      = true;
+            continue;
+        }
+
+        bool queue_full;
+        {
+            std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+            queue_full = (int)decoded_frame_queue.size() >= MAX_DECODED_FRAMES;
+        }
+        if (queue_full || !video_codec_ctx || !frame_buffer) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        double tb     = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
+        double vstart = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
+                        ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
+        double cur_pos = decode_position_hint; // قراءة ذرية آمنة
+
+        int ret = avcodec_receive_frame(video_codec_ctx, vf);
+        if (ret == 0) {
+            double pts = (vf->pts != AV_NOPTS_VALUE) ? (vf->pts * tb) - vstart : cur_pos;
+            if (pts < cur_pos - 0.5) { av_frame_unref(vf); continue; }
+
+            if (!sws_ctx)
+                sws_ctx = sws_getContext(video_width, video_height, (AVPixelFormat)vf->format,
+                                         video_width, video_height, AV_PIX_FMT_RGB24,
+                                         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+
+            uint8_t *dst[4] = { frame_buffer, nullptr, nullptr, nullptr };
+            int dls[4]      = { video_width * 3, 0, 0, 0 };
+            sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, dst, dls);
+
+            DecodedFrame df;
+            df.pts = pts;
+            df.data.resize(video_width * video_height * 3);
+            memcpy(df.data.ptrw(), frame_buffer, df.data.size());
+
+            {
+                std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+                decoded_frame_queue.push_back(std::move(df));
+            }
+
+            if (!first_frame_decoded_logged.exchange(true)) {
+                UtilityFunctions::print("[TIMING] أول إطار فيديو مفكوك بعد ", _elapsed_ms_since_load(), "ms");
+            }
+
+            av_frame_unref(vf);
+            continue;
+        }
+
+        if (ret == AVERROR(EAGAIN)) {
+            // [THREAD-SAFE v7.0] نفس حماية network_queue_mutex المستخدمة أصلاً
+            AVPacket *p = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(network_queue_mutex);
+                if (!video_packet_queue.empty()) {
+                    p = video_packet_queue.front();
+                    video_packet_queue.pop_front();
+                }
+            }
+            if (!p) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            int sr = avcodec_send_packet(video_codec_ctx, p);
+            av_packet_free(&p);
+            if (sr < 0 && sr != AVERROR(EAGAIN))
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // خطأ آخر غير متوقع — لا نُسقط الخيط، فقط ننتظر قليلًا ونعيد المحاولة
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    av_frame_free(&vf);
 }
 
 // ─── [THREAD-SAFE v7.0] خيط القراءة الشبكية المستمرة للصوت الخارجي ──────────
@@ -1279,11 +1385,15 @@ void FFmpegPlayer::seek(double seconds) {
 
     if (in_buf) {
         // Fast Seek — لا يلمس video_packet_queue/audio_packet_queue إطلاقًا
-        // (فقط طوابير فك التشفير المحلية للخيط الرئيسي)، لذا آمن كما هو
-        // بغض النظر عن نشاط أي خيط قراءة شبكي.
-        while (!decoded_frame_queue.empty() &&
-               decoded_frame_queue.front().pts < seconds)
-            decoded_frame_queue.pop_front();
+        // (فقط طوابير فك التشفير)، لذا آمن كما هو بغض النظر عن نشاط أي خيط
+        // قراءة شبكي. [DECODE-THREAD v7.6] decoded_frame_queue أصبح مشتركًا
+        // مع خيط الفك للفيديو الشبكي — نحمي الوصول بالقفل.
+        {
+            std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+            while (!decoded_frame_queue.empty() &&
+                   decoded_frame_queue.front().pts < seconds)
+                decoded_frame_queue.pop_front();
+        }
         // [6] مسح إطارات الصوت القديمة
         while (!decoded_audio_queue.empty()) {
             AVFrame *af = decoded_audio_queue.front();
@@ -1311,6 +1421,13 @@ void FFmpegPlayer::seek(double seconds) {
         network_seek_failed     = false;
         network_seek_target_secs = seconds;
         network_seek_requested   = true;
+
+        // [DECODE-THREAD v7.6] نفس الأمر لخيط الفك — هو المالك الحصري لـ
+        // video_codec_ctx الآن، فلا نستدعي avcodec_flush_buffers من هنا
+        if (decode_thread_active) {
+            decode_flush_done      = false;
+            decode_flush_requested = true;
+        }
 
         // نفس الأمر للصوت الخارجي الشبكي إن كان نشطًا — يعالج نفسه بنفسه
         if (ext_network_reader_active) {
@@ -1418,9 +1535,13 @@ void FFmpegPlayer::_process(double delta) {
 
     // ── [THREAD-SAFE v7.0] التقاط نتيجة عملية Seek شبكية من الخيط الخلفي ─────
     // يجب أيضًا أن يحدث قبل early-return لأن playing=false طوال فترة الانتظار
-    if (pending_video_seek_active && network_seek_done) {
+    // [DECODE-THREAD v7.6] ننتظر أيضًا decode_flush_done قبل إتمام الـ Seek —
+    // وإلا قد يبدأ التخزين من جديد بينما خيط الفك لا يزال يُفرِّغ حالته القديمة.
+    bool decode_flush_ready = !decode_thread_active || decode_flush_done;
+    if (pending_video_seek_active && network_seek_done && decode_flush_ready) {
         pending_video_seek_active = false;
         network_seek_done = false;
+        decode_flush_done = false;
 
         if (network_seek_failed) {
             _emit_playback_error("Seek failed (network): " + String::num(pending_video_seek_target, 2) + "s");
@@ -1429,6 +1550,7 @@ void FFmpegPlayer::_process(double delta) {
             playing = pending_autoplay_after_seek;
         } else {
             position = pending_video_seek_target;
+            decode_position_hint = position; // [DECODE-THREAD v7.6]
             frame_timer = 0.0; forward_buffer_secs = 0.0;
             // buffering يبقى true؛ الحلقة الطبيعية أدناه (if (buffering)) ستملأ
             // المخزن تدريجيًا من نقطة الـ Seek الجديدة (يقرأها الخيط الخلفي
@@ -1487,7 +1609,11 @@ void FFmpegPlayer::_process(double delta) {
     if (buffering) {
         _read_packets_to_queue();
         _read_ext_audio_packets();
-        _decode_packets_into_queue();
+        // [DECODE-THREAD v7.6] للفيديو الشبكي، خيط الفك المستقل يتكفل بهذا
+        // باستمرار في الخلفية — لا نستدعيها هنا لتفادي تنافس على video_codec_ctx.
+        // للملفات المحلية (لا خيط فك مستقل) نبقي المسار القديم كما هو تمامًا.
+        if (!video_is_network_source)
+            _decode_packets_into_queue(true); // [GREEDY-DECODE v7.5.1]
         if (audio_active_source == AudioActiveSource::INTERNAL_EMBEDDED)
             _decode_audio_into_queue();
         if (external_audio_requested && ext_audio_ctx)
@@ -1508,9 +1634,14 @@ void FFmpegPlayer::_process(double delta) {
         // فورًا بينما تبقى الشاشة سوداء لثوانٍ حتى يلحق فك التشفير — تمامًا
         // النمط المُبلَّغ عنه: "الصوت ينطلق بامتياز، الصورة تتأخر 7-8 ثوانٍ".
         // الآن ننتظر الاثنين معًا: بيانات كافية + إطار مفكوك جاهز فعليًا.
-        bool first_frame_ready = !decoded_frame_queue.empty();
+        // [DECODE-THREAD v7.6] decoded_frame_queue مشترك مع خيط الفك الآن.
+        bool first_frame_ready;
+        {
+            std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+            first_frame_ready = !decoded_frame_queue.empty();
+        }
 
-        if ((enough_buffered || (stream_exhausted && !decoded_frame_queue.empty()))
+        if ((enough_buffered || (stream_exhausted && first_frame_ready))
             && first_frame_ready) {
             buffering = false;
             first_buffer_done = true;
@@ -1527,7 +1658,13 @@ void FFmpegPlayer::_process(double delta) {
     }
 
     // نضوب البافر (Underrun)
-    if (forward_buffer_secs < 0.2 && decoded_frame_queue.empty()) {
+    // [DECODE-THREAD v7.6] قراءة محمية بالقفل
+    bool decoded_empty_for_underrun;
+    {
+        std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        decoded_empty_for_underrun = decoded_frame_queue.empty();
+    }
+    if (forward_buffer_secs < 0.2 && decoded_empty_for_underrun) {
         buffering = true; _pause_audio();
         if (is_inside_tree()) emit_signal("buffering_changed", true);
         UtilityFunctions::print("[BUFFER] Underrun pos=", position);
@@ -1559,16 +1696,23 @@ void FFmpegPlayer::_process(double delta) {
 
         // [11] Hard Frame Drop: إسقاط إطارات الفيديو المتأخرة
         // إذا تأخر الفيديو عن الصوت بأكثر من HARD_DROP_THRESHOLD
-        while (decoded_frame_queue.size() > 1) {
-            double frame_pts = decoded_frame_queue.front().pts;
-            if (audio_clk - frame_pts > HARD_DROP_THRESHOLD)
-                decoded_frame_queue.pop_front(); // اسقط الإطار المتأخر
-            else break;
+        // [DECODE-THREAD v7.6] decoded_frame_queue مشترك مع خيط الفك الآن
+        // (للفيديو الشبكي) — نحمي الوصول بالقفل.
+        {
+            std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+            while (decoded_frame_queue.size() > 1) {
+                double frame_pts = decoded_frame_queue.front().pts;
+                if (audio_clk - frame_pts > HARD_DROP_THRESHOLD)
+                    decoded_frame_queue.pop_front(); // اسقط الإطار المتأخر
+                else break;
+            }
         }
 
         position = audio_clk;
+        decode_position_hint = position; // [DECODE-THREAD v7.6]
     } else {
         position += delta;
+        decode_position_hint = position; // [DECODE-THREAD v7.6]
         // [AV-SYNC v6.5] هذا المسار (صوت خارجي محلي عبر AudioStreamPlayer) هو
         // الوحيد الذي لا يعتمد على ساعة صوت فعلية، لذا نراقبه ونصححه هنا
         _check_av_sync(delta);
@@ -1580,7 +1724,10 @@ void FFmpegPlayer::_process(double delta) {
     _read_packets_to_queue();
     _read_ext_audio_packets();
 
-    if ((int)decoded_frame_queue.size() < MAX_DECODED_FRAMES)
+    // [DECODE-THREAD v7.6] نفس المنطق: خيط الفك المستقل يتكفل بالفيديو
+    // الشبكي باستمرار؛ الملفات المحلية تبقى على المسار المتزامن القديم
+    // (بلا خيط منافس هنا، فلا حاجة لقفل decoded_frame_mutex في هذا الفرع).
+    if (!video_is_network_source && (int)decoded_frame_queue.size() < MAX_DECODED_FRAMES)
         _decode_packets_into_queue();
 
     // [v6.2] نفك تشفير الصوت الداخلي فقط طالما هو المصدر النشط حاليًا —
@@ -1616,8 +1763,14 @@ void FFmpegPlayer::_process(double delta) {
     //   3) إن كان هناك صوت خارجي شبكي نشط: ديموكسره أيضًا وصل EOF وطوابيره فارغة
     //   4) بافر الصوت المسموع (AudioStreamGenerator) لم يعد يحتوي صوتًا لم يُسمع بعد
     if (demux_eof_reached) {
-        bool video_drained = video_packet_queue.empty() &&
-                              decoded_frame_queue.size() <= 1;
+        // [DECODE-THREAD v7.6] video_packet_queue (خيط الشبكة) و decoded_frame_queue
+        // (خيط الفك) كلاهما مشترك الآن — نحمي القراءة بأقفالهما المناسبة.
+        bool video_drained;
+        {
+            std::lock_guard<std::mutex> lock1(network_queue_mutex);
+            std::lock_guard<std::mutex> lock2(decoded_frame_mutex);
+            video_drained = video_packet_queue.empty() && decoded_frame_queue.size() <= 1;
+        }
 
         bool internal_audio_drained = audio_packet_queue.empty() &&
                                        decoded_audio_queue.empty();
@@ -1673,16 +1826,17 @@ void FFmpegPlayer::_update_buffer_stats() {
     int    diag_pkt_queue_size = 0;
     String diag_branch         = "?";
     double diag_last_pkt_time  = -1.0;
+    bool   pkt_queue_was_empty = true;
 
+    // [DECODE-THREAD v7.6] فصلنا القفلين (network_queue_mutex هنا،
+    // decoded_frame_mutex أدناه) بدل تداخلهما — decoded_frame_queue لم يعد
+    // محميًا بـ network_queue_mutex، فهو طابور خيط الفك المستقل الآن.
     {
         std::lock_guard<std::mutex> lock(network_queue_mutex);
         diag_pkt_queue_size = (int)video_packet_queue.size();
+        pkt_queue_was_empty = video_packet_queue.empty();
 
-        if (video_packet_queue.empty()) {
-            diag_branch = "decoded_frame_queue (packet_queue فارغ)";
-            forward_buffer_secs = decoded_frame_queue.empty() ? 0.0
-                : Math::max(0.0, decoded_frame_queue.back().pts - position);
-        } else {
+        if (!pkt_queue_was_empty) {
             diag_branch = "video_packet_queue (آخر حزمة)";
             AVPacket *last = video_packet_queue.back();
             if (last->pts != AV_NOPTS_VALUE) {
@@ -1690,6 +1844,18 @@ void FFmpegPlayer::_update_buffer_stats() {
                 forward_buffer_secs = Math::max(0.0, diag_last_pkt_time - position);
             }
         }
+    }
+
+    int diag_decoded_queue_size = 0;
+    if (pkt_queue_was_empty) {
+        diag_branch = "decoded_frame_queue (packet_queue فارغ)";
+        std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        diag_decoded_queue_size = (int)decoded_frame_queue.size();
+        forward_buffer_secs = decoded_frame_queue.empty() ? 0.0
+            : Math::max(0.0, decoded_frame_queue.back().pts - position);
+    } else {
+        std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        diag_decoded_queue_size = (int)decoded_frame_queue.size();
     }
 
     // [BUFFER-OSCILLATION-DIAG v7.5.1] طباعة مُهدَّأة (كل ~0.5 ثانية) تكشف
@@ -1703,7 +1869,7 @@ void FFmpegPlayer::_update_buffer_stats() {
     if (std::chrono::duration<double>(diag_now - diag_last_print).count() >= 0.5) {
         diag_last_print = diag_now;
         UtilityFunctions::print("[BUF-DIAG] video_pkt_q=", diag_pkt_queue_size,
-            " | decoded_frame_q=", (int)decoded_frame_queue.size(),
+            " | decoded_frame_q=", diag_decoded_queue_size,
             " | المصدر=", diag_branch,
             " | آخر_وقت_حزمة=", diag_last_pkt_time,
             " | position=", position,
@@ -1813,7 +1979,13 @@ void FFmpegPlayer::_read_ext_audio_packets() {
 }
 
 // ─── فك تشفير الفيديو ────────────────────────────────────────────────────────
-void FFmpegPlayer::_decode_packets_into_queue() {
+// [GREEDY-DECODE v7.5.1] greedy=true أثناء التخزين الأولي فقط (buffering)،
+// حيث لا توجد صورة معروضة بعد لنحميها من تجمّد لحظي — سرعة الوصول لأول
+// إطار أهم بكثير من حماية سلاسة إطار عرض لم يبدأ أصلاً. اكتشفنا أن بعض
+// أجهزة MediaCodec (Mali-G57 مثلاً) تحتاج ~100-140 حزمة مُطعَمة قبل إخراج
+// أول إطار — تقييد الإطعام بحد متحفّظ (50) يُبطئ الوصول لهذا العمق بلا أي
+// فائدة (البيانات لا "تُفقَد" بل تنتظر وصول المزيد من الشبكة أصلاً).
+void FFmpegPlayer::_decode_packets_into_queue(bool greedy) {
     if (!video_codec_ctx || !frame_buffer) return;
     if ((int)decoded_frame_queue.size() >= MAX_DECODED_FRAMES) return;
 
@@ -1823,8 +1995,11 @@ void FFmpegPlayer::_decode_packets_into_queue() {
 
     AVFrame *vf  = av_frame_alloc();
     int loops    = 0;
+    // أثناء التشغيل الفعلي نبقي الحد المحافظ (50) لحماية سلاسة الإطار
+    // الحالي المعروض من تجمّد لحظي على الخيط الرئيسي.
+    const int max_loops = greedy ? 500 : 50;
 
-    while ((int)decoded_frame_queue.size() < MAX_DECODED_FRAMES && loops++ < 50) {
+    while ((int)decoded_frame_queue.size() < MAX_DECODED_FRAMES && loops++ < max_loops) {
         int ret = avcodec_receive_frame(video_codec_ctx, vf);
         if (ret == 0) {
             double pts = (vf->pts != AV_NOPTS_VALUE) ? (vf->pts * tb) - vstart : position;
@@ -1928,39 +2103,51 @@ void FFmpegPlayer::_decode_ext_audio_into_queue() {
     }
 }
 // ─── [11] عرض الإطار (مع كبح جماح الـ Hard Drop لمنع الـ Lag) ─────────────────────
+// [DECODE-THREAD v7.6] decoded_frame_queue مشترك مع خيط الفك الآن — نحصر كل
+// الوصول إليه داخل قفل واحد، وننسخ البيانات المطلوبة صراحة قبل تحريره (أكثر
+// أمانًا من الاعتماد على استقرار مرجع عبر خيطين، رغم أن push_back في deque
+// لا يُبطل مرجع العنصر الأمامي أصلاً حسب المعيار).
 bool FFmpegPlayer::_present_frame_at(double pos) {
-    if (decoded_frame_queue.empty()) return false;
+    double f_pts;
+    PackedByteArray f_data;
+    {
+        std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        if (decoded_frame_queue.empty()) return false;
 
-    int frames_dropped_this_tick = 0;
-    const int MAX_FRAMES_TO_DROP_PER_TICK = 3; // حد أمان يمنع تشنج المعالج
+        int frames_dropped_this_tick = 0;
+        const int MAX_FRAMES_TO_DROP_PER_TICK = 3; // حد أمان يمنع تشنج المعالج
 
-    // البحث عن الإطار الأنسب للوقت الحالي وإسقاط كل ما تجاوزه الزمن بشكل تدريجي
-    while (decoded_frame_queue.size() > 1) {
-        double next_pts = decoded_frame_queue[1].pts;
+        // البحث عن الإطار الأنسب للوقت الحالي وإسقاط كل ما تجاوزه الزمن بشكل تدريجي
+        while (decoded_frame_queue.size() > 1) {
+            double next_pts = decoded_frame_queue[1].pts;
 
-        // إذا كان الإطار التالي قد حان موعده
-        if (next_pts <= pos) {
-            decoded_frame_queue.pop_front();
-            frames_dropped_this_tick++;
+            // إذا كان الإطار التالي قد حان موعده
+            if (next_pts <= pos) {
+                decoded_frame_queue.pop_front();
+                frames_dropped_this_tick++;
 
-            // إذا وصلنا للحد المسموح به في هذا الفريم، نخرج فوراً ونترك الباقي للفريم القادم
-            if (frames_dropped_this_tick >= MAX_FRAMES_TO_DROP_PER_TICK) {
+                // إذا وصلنا للحد المسموح به في هذا الفريم، نخرج فوراً ونترك الباقي للفريم القادم
+                if (frames_dropped_this_tick >= MAX_FRAMES_TO_DROP_PER_TICK) {
+                    break;
+                }
+            } else {
                 break;
             }
-        } else {
-            break;
         }
+
+        const DecodedFrame &f = decoded_frame_queue.front();
+
+        // إذا كان الإطار الحالي لا يزال بعيداً عن وقت العرض (أكثر من 40ms) ننتظر
+        if (f.pts > pos + 0.04) return false;
+
+        f_pts  = f.pts;
+        f_data = f.data;
     }
 
-    const DecodedFrame &f = decoded_frame_queue.front();
-
-    // إذا كان الإطار الحالي لا يزال بعيداً عن وقت العرض (أكثر من 40ms) ننتظر
-    if (f.pts > pos + 0.04) return false;
-
-    if (!current_texture.is_valid() || f.data.is_empty()) return false;
+    if (!current_texture.is_valid() || f_data.is_empty()) return false;
 
     // تحديث الصورة المعروضة
-    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, f.data);
+    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, f_data);
     current_texture->update(img);
     _emit_frame_updated();
 
@@ -2015,7 +2202,11 @@ void FFmpegPlayer::_clear_queues() {
     for (auto *f : ext_audio_frame_queue) av_frame_free(&f);
     ext_audio_frame_queue.clear();
 
-    decoded_frame_queue.clear();
+    // [DECODE-THREAD v7.6] decoded_frame_queue مشترك مع خيط الفك الآن
+    {
+        std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        decoded_frame_queue.clear();
+    }
     forward_buffer_secs = 0.0;
 }
 
@@ -2072,6 +2263,17 @@ void FFmpegPlayer::_cleanup() {
     pending_video_seek_active  = false;
     video_is_network_source    = false;
 
+    // [DECODE-THREAD v7.6] أوقف خيط فك التشفير المستقل قبل تحرير
+    // video_codec_ctx/sws_ctx أدناه — إغلاقهما أثناء استخدام الخيط لهما
+    // كارثي (استخدام بعد التحرير). بفضل sleep القصيرة داخل حلقته، لا يوجد
+    // انتظار I/O طويل هنا (بعكس خيوط الشبكة)، فهذا join() سريع دائمًا.
+    if (decode_thread_active) {
+        decode_thread_active = false;
+        if (decode_thread.joinable()) decode_thread.join();
+    }
+    decode_flush_requested = false;
+    decode_flush_done      = false;
+
     _clear_queues();
     _cleanup_ext_audio(); // يوقف ext_network_read_thread داخليًا أيضًا الآن
     _stop_audio();
@@ -2116,8 +2318,13 @@ void FFmpegPlayer::_emit_playback_error(const String &m) {
     if (is_inside_tree()) emit_signal("playback_error", m);
 }
 void FFmpegPlayer::_emit_buffering_status() {
-    double lo = decoded_frame_queue.empty() ? 0.0
-              : Math::max(0.0, decoded_frame_queue.front().pts - position);
+    // [DECODE-THREAD v7.6] decoded_frame_queue مشترك مع خيط الفك الآن
+    double lo;
+    {
+        std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        lo = decoded_frame_queue.empty() ? 0.0
+           : Math::max(0.0, decoded_frame_queue.front().pts - position);
+    }
     if (is_inside_tree())
         emit_signal("buffering_status", (float)lo, (float)forward_buffer_secs);
 }
