@@ -2,7 +2,7 @@
  * ffmpeg_player.h
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4 (Android ARM64/ARM32)
  *
- * الإصدار الحالي: 7.6
+ * الإصدار الحالي: 7.10
  * سجل التغييرات الكامل (كل إصدار وسببه): راجع CHANGELOG_ffmpeg_player.md
  * بجانب هذا الملف — لا تُضِف تاريخ إصدارات هنا، فقط الكود.
  */
@@ -32,6 +32,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <functional>
 #include <chrono>
 
 extern "C" {
@@ -92,6 +93,18 @@ public:
     double get_forward_buffer()  const { return forward_buffer_secs; }
     bool   is_buffering()        const { return buffering; }
     float  get_buffer_status();
+
+    // ── [STATE-MACHINE v7.10 — خطوة 4] حالة تشغيل صريحة (للعرض/التشخيص فقط) ──
+    // نمط مقتبس من DecoderState في EIRTeam.FFmpeg، لكن بتصميم أكثر أمانًا:
+    // بدل استبدال أعلام playing/buffering الداخلية (خطر حقيقي على منطق
+    // _process() المُختبَر جيدًا عبر هذه المحادثة الطويلة)، هذه دالة حساب
+    // "للقراءة فقط" تُشتَق من الأعلام الموجودة فعليًا دون تغييرها إطلاقًا —
+    // توفّر وضوحًا للتشخيص/الواجهة (GDScript) بلا أي خطر على السلوك الداخلي.
+    // القيم: 0=NONE (لا فيديو محمَّل) | 1=STOPPED (محمَّل، لم يبدأ/أُعيد
+    // لـ 0.0) | 2=PAUSED (متوقف مؤقتًا) | 3=BUFFERING | 4=PLAYING |
+    // 5=FAULTED (فشل فك التشفير بالكامل، عتاد وبرمجي معًا).
+    enum class PlaybackState { NONE = 0, STOPPED = 1, PAUSED = 2, BUFFERING = 3, PLAYING = 4, FAULTED = 5 };
+    int get_playback_state() const; // يُعيد PlaybackState كعدد صحيح للـ GDScript
 
     void _ready()               override;
     void _process(double delta) override;
@@ -214,11 +227,71 @@ private:
     std::atomic<bool>  decode_thread_active{false};
     std::mutex         decoded_frame_mutex; // يحمي decoded_frame_queue فقط
 
-    std::atomic<bool>  decode_flush_requested{false}; // طلب تفريغ من seek()
+    // ── [COMMAND-QUEUE v7.7 — خطوة 1] طابور أوامر عام لخيط الفك ──────────────
+    // بدل اختراع زوج أعلام Atomic (طلب/إنجاز) جديد لكل ميزة تحتاج تنفيذًا
+    // على خيط الفك (كما فعلنا مع decode_flush_requested/done) — نمط اقتبسناه
+    // من مشروع EIRTeam.FFmpeg الناضج (يستخدم CommandQueueMT لنفس الغرض).
+    // أي كود مستقبلي يحتاج تنفيذ شيء على خيط الفك يستدعي _post_decode_command()
+    // بإغلاق (lambda) بدل إضافة أعلام جديدة. الخيط يُفرِّغ الطابور ويُنفِّذه في
+    // بداية كل دورة من حلقته. إشارة "اكتمل" (إن احتاجها المستدعي) تبقى مسؤولية
+    // كل أمر بمفرده (كما في decode_flush_done أدناه) — الطابور فقط يوصل العمل.
+    std::mutex decode_command_mutex;
+    std::deque<std::function<void()>> decode_command_queue;
+    void _post_decode_command(std::function<void()> cmd);
+
+    // [COMMAND-QUEUE v7.7] decode_flush_requested الذري القديم أُزيل — التفريغ
+    // الآن يُرسَل كأمر عبر _post_decode_command() (انظر seek() في .cpp).
+    // decode_flush_done يبقى كما هو: إشارة إنجاز خاصة بهذا الأمر تحديدًا.
     std::atomic<bool>  decode_flush_done{false};
     // نسخة ذرية آمنة من position يقرأها خيط الفك (بدل قراءة position مباشرة
     // من خيط آخر، وهو متغيّر double عادي غير آمن للقراءة/الكتابة المتزامنة)
     std::atomic<double> decode_position_hint{0.0};
+
+    // ── [OBJECT-POOL v7.8 — خطوة 2] تجميع إعادة استخدام الذاكرة ─────────────
+    // نمط مقتبس من EIRTeam.FFmpeg (available_textures/hw_transfer_frames).
+    // بدون هذا: تخصيص PackedByteArray جديد كامل الحجم (~1-2 ميجابايت للفيديو
+    // النموذجي) في كل إطار مفكوك + كائن Image جديد في كل إطار معروض (حتى 60
+    // مرة/ثانية أثناء التشغيل) — ضغط غير ضروري على الذاكرة/GC خصوصًا على
+    // أجهزة محدودة الموارد. الآن نعيد استخدام نفس المخازن بدل التخصيص المتكرر.
+    std::mutex frame_pool_mutex;
+    std::vector<PackedByteArray> free_frame_buffers; // مخازن بايت جاهزة لإعادة الاستخدام
+    static const int MAX_POOLED_BUFFERS = 12; // MAX_DECODED_FRAMES + هامش صغير
+
+    // يسحب مخزنًا من المجمّع بالحجم المطلوب، أو يُنشئ واحدًا جديدًا إن فرغ المجمّع
+    PackedByteArray _acquire_frame_buffer(int required_size);
+    // يُعيد مخزنًا للمجمّع لإعادة استخدامه لاحقًا (بدل تركه يُحرَّر ويُعاد تخصيصه)
+    void _release_frame_buffer(PackedByteArray &&buf);
+
+    // كائن Image واحد يُعاد استخدامه في كل إطار معروض بدل إنشاء كائن جديد
+    // في كل مرة عبر Image::create_from_data() — يُنشأ مرة واحدة فقط عند
+    // الحاجة، ثم نُحدِّث بياناته فقط عبر set_data() في كل إطار لاحق.
+    Ref<Image> reusable_present_image;
+
+    // ── [HW-FALLBACK v7.9 — خطوة 3] تراجع تلقائي من العتاد للبرمجي ──────────
+    // نمط مقتبس من _try_disable_hw_decoding() في EIRTeam.FFmpeg. إن بدأ
+    // فك التشفير بالعتاد (MediaCodec) بالفشل بشكل متكرر أثناء التشغيل الفعلي
+    // (وليس فقط عند الفتح الأولي، والذي يُعالَج بشكل منفصل في
+    // _setup_video_codec)، نتراجع تلقائيًا لفك تشفير برمجي بدل توقف كامل.
+    bool hw_decode_active     = false; // هل الديكودر الحالي عتاد فعليًا؟
+    int  hw_decode_fail_count = 0;     // عدّاد أخطاء متتالية (غير EAGAIN)
+    static const int HW_DECODE_FAIL_THRESHOLD = 10; // بعدها نتراجع للبرمجي
+    // [STATE-MACHINE v7.10] true فقط إذا فشل فتح ديكودر برمجي بديل أيضًا
+    // بعد فشل العتاد أثناء التشغيل — حالة غير قابلة للتعافي (FAULTED).
+    // atomic لأنها قد تُكتب من خيط الفك الشبكي وتُقرأ من الخيط الرئيسي.
+    std::atomic<bool> decoder_faulted{false};
+    // علم منفصل لإصدار إشارة الخطأ مرة واحدة فقط (decoder_faulted نفسه يبقى
+    // true دائمًا لأغراض get_playback_state()، فلا نستخدمه للتحكم بالإصدار).
+    std::atomic<bool> decoder_fault_notified{false};
+    // [STATE-MACHINE v7.10] يُميّز STOPPED (بعد stop() أو تحميل جديد) عن
+    // PAUSED (بعد pause()) — كلاهما playing=false، لكن الفرق مهم للعرض.
+    bool explicitly_stopped = true;
+
+    // يُستدعى فقط من الخيط المالك الحصري لـ video_codec_ctx (خيط الفك
+    // للشبكي، الخيط الرئيسي للمحلي) — لا قفل إضافي مطلوب.
+    void _try_disable_hw_decoding();
+    // يُستدعى عند أي خطأ حقيقي (غير EAGAIN) من send_packet/receive_frame —
+    // يزيد العدّاد ويُفعِّل التراجع تلقائيًا عند بلوغ الحد.
+    void _handle_decode_error();
 
     void _decode_thread_worker();
 

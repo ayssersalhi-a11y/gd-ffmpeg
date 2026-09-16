@@ -2,7 +2,7 @@
  * ffmpeg_player.cpp
  * GDExtension — FFmpeg Video Player (Unified) for Godot 4
  *
- * الإصدار الحالي: 7.6
+ * الإصدار الحالي: 7.10
  * سجل التغييرات الكامل (كل إصدار وسببه): راجع CHANGELOG_ffmpeg_player.md
  * بجانب هذا الملف — لا تُضِف تاريخ إصدارات هنا، فقط الكود.
  */
@@ -65,6 +65,8 @@ void FFmpegPlayer::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_forward_buffer"),        &FFmpegPlayer::get_forward_buffer);
     ClassDB::bind_method(D_METHOD("is_buffering"),              &FFmpegPlayer::is_buffering);
     ClassDB::bind_method(D_METHOD("get_buffer_status"),         &FFmpegPlayer::get_buffer_status);
+    // [STATE-MACHINE v7.10] حالة تشغيل صريحة للقراءة من GDScript
+    ClassDB::bind_method(D_METHOD("get_playback_state"),        &FFmpegPlayer::get_playback_state);
 
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 
@@ -166,7 +168,7 @@ void FFmpegPlayer::_ready() {
     ext_audio_player->set_name("_ExtAudioPlayer");
     add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v7.6 ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v7.10 ---");
 
     // [DECODER-WARMUP-JNI-FIX v7.5.1] تصحيح جوهري: خيط std::thread خام غير
     // مرتبط ببيئة JNI الخاصة بأندرويد التي يحتاجها MediaCodec داخليًا —
@@ -414,9 +416,8 @@ bool FFmpegPlayer::_finalize_loaded_video(AVFormatContext *opened_ctx, bool is_l
         // [DECODE-THREAD v7.6] وخيط فك تشفير مستقل — من هذه اللحظة فصاعدًا
         // هذا الخيط هو المالك الحصري لـ video_codec_ctx/sws_ctx.
         decode_thread_active = true;
-        decode_flush_requested = false;
-        decode_flush_done      = false;
-        decode_position_hint   = position;
+        decode_flush_done    = false;
+        decode_position_hint = position;
         decode_thread = std::thread(&FFmpegPlayer::_decode_thread_worker, this);
         UtilityFunctions::print("[DECODE-THREAD] Background decode thread started.");
     }
@@ -524,20 +525,58 @@ void FFmpegPlayer::_network_read_worker() {
 // سرعة ممكنة — لا يوجد سبب للتقييد هنا؛ إن لم توجد حزمة، ننام قليلًا فقط.
 // هذا يحل مشكلة "عمق أنبوب MediaCodec" (بعض الأجهزة تحتاج ~100-140 حزمة
 // قبل إخراج أول إطار) دون انتظار دورها ضمن معدل إطارات Godot في _process().
+// ─── [COMMAND-QUEUE v7.7 — خطوة 1] إرسال أمر لخيط الفك ──────────────────────
+// يُستدعى من أي خيط (عادة الرئيسي). آمن — مجرد قفل قصير + دفع إغلاق للطابور.
+void FFmpegPlayer::_post_decode_command(std::function<void()> cmd) {
+    std::lock_guard<std::mutex> lock(decode_command_mutex);
+    decode_command_queue.push_back(std::move(cmd));
+}
+
+// ─── [OBJECT-POOL v7.8 — خطوة 2] تجميع إعادة استخدام مخازن البايت ───────────
+// آمن للاستدعاء من أي خيط (محمي بقفل مخصص)، رغم أن الاستخدام الفعلي حاليًا
+// من خيط الفك (شبكي) ومسار الفك المتزامن (ملفات محلية) فقط.
+PackedByteArray FFmpegPlayer::_acquire_frame_buffer(int required_size) {
+    std::lock_guard<std::mutex> lock(frame_pool_mutex);
+    while (!free_frame_buffers.empty()) {
+        PackedByteArray buf = std::move(free_frame_buffers.back());
+        free_frame_buffers.pop_back();
+        if (buf.size() == required_size) return buf; // إعادة استخدام مباشرة
+        // حجم غير مطابق (تغيّرت أبعاد الفيديو منذ آخر استخدام) — جرّب التالي
+    }
+    // المجمّع فارغ أو لا يحتوي حجمًا مطابقًا — نُنشئ مخزنًا جديدًا (Fallback آمن)
+    PackedByteArray fresh;
+    fresh.resize(required_size);
+    return fresh;
+}
+
+// يُعيد مخزنًا للمجمّع لإعادة استخدامه لاحقًا. آمن للاستدعاء من أي خيط.
+void FFmpegPlayer::_release_frame_buffer(PackedByteArray &&buf) {
+    if (buf.is_empty()) return;
+    std::lock_guard<std::mutex> lock(frame_pool_mutex);
+    if ((int)free_frame_buffers.size() < MAX_POOLED_BUFFERS)
+        free_frame_buffers.push_back(std::move(buf));
+    // إن كان المجمّع ممتلئًا بالفعل، نترك المخزن يُحرَّر طبيعيًا (نادر الحدوث)
+}
+
 void FFmpegPlayer::_decode_thread_worker() {
     AVFrame *vf = av_frame_alloc();
 
     while (decode_thread_active) {
-        // ── معالجة طلب تفريغ من seek() (نحن المالك الحصري لـ video_codec_ctx) ──
-        if (decode_flush_requested) {
-            if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
+        // ── [COMMAND-QUEUE v7.7] تنفيذ أي أوامر معلّقة أولًا ──────────────────
+        // بدل فحص علم decode_flush_requested وحيد الغرض، نُفرِّغ الطابور
+        // العام ونُنفِّذ كل ما فيه — يشمل هذا اليوم أمر التفريغ عند Seek، وأي
+        // أمر مستقبلي دون الحاجة لإضافة علم Atomic جديد لكل ميزة.
+        {
+            std::deque<std::function<void()>> commands_to_run;
             {
-                std::lock_guard<std::mutex> lock(decoded_frame_mutex);
-                decoded_frame_queue.clear();
+                std::lock_guard<std::mutex> lock(decode_command_mutex);
+                if (!decode_command_queue.empty())
+                    commands_to_run.swap(decode_command_queue);
             }
-            decode_flush_requested = false;
-            decode_flush_done      = true;
-            continue;
+            if (!commands_to_run.empty()) {
+                for (auto &cmd : commands_to_run) cmd();
+                continue; // أعد فحص الحلقة من جديد بعد تنفيذ الأوامر
+            }
         }
 
         bool queue_full;
@@ -571,7 +610,8 @@ void FFmpegPlayer::_decode_thread_worker() {
 
             DecodedFrame df;
             df.pts = pts;
-            df.data.resize(video_width * video_height * 3);
+            // [OBJECT-POOL v7.8] إعادة استخدام مخزن جاهز بدل تخصيص جديد كامل
+            df.data = _acquire_frame_buffer(video_width * video_height * 3);
             memcpy(df.data.ptrw(), frame_buffer, df.data.size());
 
             {
@@ -582,6 +622,7 @@ void FFmpegPlayer::_decode_thread_worker() {
             if (!first_frame_decoded_logged.exchange(true)) {
                 UtilityFunctions::print("[TIMING] أول إطار فيديو مفكوك بعد ", _elapsed_ms_since_load(), "ms");
             }
+            hw_decode_fail_count = 0; // [HW-FALLBACK v7.9] نجاح يُصفِّر عدّاد الفشل
 
             av_frame_unref(vf);
             continue;
@@ -603,12 +644,15 @@ void FFmpegPlayer::_decode_thread_worker() {
             }
             int sr = avcodec_send_packet(video_codec_ctx, p);
             av_packet_free(&p);
-            if (sr < 0 && sr != AVERROR(EAGAIN))
+            if (sr < 0 && sr != AVERROR(EAGAIN)) {
+                _handle_decode_error(); // [HW-FALLBACK v7.9]
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             continue;
         }
 
         // خطأ آخر غير متوقع — لا نُسقط الخيط، فقط ننتظر قليلًا ونعيد المحاولة
+        _handle_decode_error(); // [HW-FALLBACK v7.9]
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -672,14 +716,14 @@ void FFmpegPlayer::_ext_network_read_worker() {
 // ─── إعداد كودك الفيديو ───────────────────────────────────────────────────────
 bool FFmpegPlayer::_setup_video_codec(AVStream *vs) {
     const AVCodec *vc = nullptr;
+    bool tried_hw = false;
     if      (vs->codecpar->codec_id == AV_CODEC_ID_H264) vc = avcodec_find_decoder_by_name("h264_mediacodec");
     else if (vs->codecpar->codec_id == AV_CODEC_ID_HEVC) vc = avcodec_find_decoder_by_name("hevc_mediacodec");
     else if (vs->codecpar->codec_id == AV_CODEC_ID_VP8)  vc = avcodec_find_decoder_by_name("vp8_mediacodec");
     else if (vs->codecpar->codec_id == AV_CODEC_ID_VP9)  vc = avcodec_find_decoder_by_name("vp9_mediacodec");
 
-    if (!vc) { vc = avcodec_find_decoder(vs->codecpar->codec_id);
-        UtilityFunctions::print("[VIDEO] SOFTWARE"); }
-    else      { UtilityFunctions::print("[VIDEO] HARDWARE (MediaCodec)"); }
+    if (vc) tried_hw = true;
+    else    vc = avcodec_find_decoder(vs->codecpar->codec_id);
 
     if (!vc) { _emit_playback_error("No video decoder"); return false; }
 
@@ -689,9 +733,37 @@ bool FFmpegPlayer::_setup_video_codec(AVStream *vs) {
         video_codec_ctx->thread_count = 0;
         video_codec_ctx->thread_type  = FF_THREAD_FRAME;
     }
+
     if (avcodec_open2(video_codec_ctx, vc, nullptr) < 0) {
-        _emit_playback_error("Cannot open video decoder"); return false;
+        avcodec_free_context(&video_codec_ctx);
+        // [HW-FALLBACK v7.9] فشل فتح ديكودر العتاد تحديدًا؟ جرّب البرمجي فورًا
+        // بدل الاستسلام الكامل — نفس فلسفة _try_disable_hw_decoding() أدناه،
+        // لكن هنا عند الفتح الأولي وليس أثناء التشغيل.
+        if (!tried_hw) { _emit_playback_error("Cannot open video decoder"); return false; }
+
+        UtilityFunctions::print("[VIDEO] فشل فتح ديكودر العتاد — تجربة البرمجي كبديل...");
+        vc = avcodec_find_decoder(vs->codecpar->codec_id);
+        if (!vc) { _emit_playback_error("Cannot open video decoder"); return false; }
+
+        video_codec_ctx = avcodec_alloc_context3(vc);
+        avcodec_parameters_to_context(video_codec_ctx, vs->codecpar);
+        video_codec_ctx->thread_count = 0;
+        video_codec_ctx->thread_type  = FF_THREAD_FRAME;
+        tried_hw = false;
+
+        if (avcodec_open2(video_codec_ctx, vc, nullptr) < 0) {
+            avcodec_free_context(&video_codec_ctx);
+            _emit_playback_error("Cannot open video decoder (hw and sw both failed)");
+            return false;
+        }
     }
+
+    // [HW-FALLBACK v7.9] تتبّع الحالة لدعم التراجع التلقائي أثناء التشغيل
+    hw_decode_active      = tried_hw;
+    hw_decode_fail_count  = 0;
+
+    UtilityFunctions::print(tried_hw ? "[VIDEO] HARDWARE (MediaCodec)" : "[VIDEO] SOFTWARE");
+
     video_width  = video_codec_ctx->width;
     video_height = video_codec_ctx->height;
     fps          = av_q2d(vs->r_frame_rate);
@@ -700,6 +772,73 @@ bool FFmpegPlayer::_setup_video_codec(AVStream *vs) {
                              video_width, video_height, AV_PIX_FMT_RGB24,
                              SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
     return true;
+}
+
+// ─── [HW-FALLBACK v7.9 — خطوة 3] معالجة خطأ فك تشفير حقيقي ──────────────────
+// يُستدعى من حلقتي الفك (خيط الشبكة، مسار الملفات المحلية) عند أي خطأ
+// حقيقي من avcodec_send_packet/receive_frame (ليس EAGAIN — ذاك طبيعي جدًا
+// ويعني فقط "أحتاج بيانات أكثر"). لا نتراجع من أول خطأ (قد يكون عارضًا
+// لحظيًا)، بل بعد HW_DECODE_FAIL_THRESHOLD خطأ متتاليًا.
+void FFmpegPlayer::_handle_decode_error() {
+    if (!hw_decode_active) return; // نحن بالفعل على البرمجي، لا شيء نتراجع إليه
+    hw_decode_fail_count++;
+    if (hw_decode_fail_count >= HW_DECODE_FAIL_THRESHOLD) {
+        _try_disable_hw_decoding();
+    }
+}
+
+// ─── [HW-FALLBACK v7.9 — خطوة 3] التراجع الفعلي من العتاد للبرمجي ───────────
+// نمط مقتبس من _try_disable_hw_decoding() في EIRTeam.FFmpeg. يُغلق جلسة
+// MediaCodec الحالية ويفتح ديكودر برمجي بديل بنفس معاملات التيار، محافظًا
+// على استمرارية التشغيل (قد يحدث تقطّع بصري بسيط لحظة التبديل حتى وصول
+// أول إطار مفتاحي جديد — طبيعي ومتوقَّع، أفضل من توقف كامل).
+void FFmpegPlayer::_try_disable_hw_decoding() {
+    if (!hw_decode_active || !video_codec_ctx) return;
+
+    AVCodecID codec_id = video_codec_ctx->codec_id;
+    const AVCodec *sw_codec = avcodec_find_decoder(codec_id);
+    if (!sw_codec) {
+        UtilityFunctions::printerr("[HW-FALLBACK] لا يوجد ديكودر برمجي بديل لهذا الترميز — لا يمكن التراجع.");
+        return;
+    }
+
+    UtilityFunctions::print("[HW-FALLBACK] فشل فك التشفير بالعتاد ", HW_DECODE_FAIL_THRESHOLD,
+        " مرة متتالية — جارٍ التراجع لفك تشفير برمجي...");
+
+    // احفظ معاملات الترميز من السياق الحالي قبل إغلاقه
+    AVCodecParameters *params_holder = avcodec_parameters_alloc();
+    avcodec_parameters_from_context(params_holder, video_codec_ctx);
+
+    avcodec_free_context(&video_codec_ctx);
+
+    video_codec_ctx = avcodec_alloc_context3(sw_codec);
+    avcodec_parameters_to_context(video_codec_ctx, params_holder);
+    avcodec_parameters_free(&params_holder);
+    video_codec_ctx->thread_count = 0;
+    video_codec_ctx->thread_type  = FF_THREAD_FRAME;
+
+    if (avcodec_open2(video_codec_ctx, sw_codec, nullptr) < 0) {
+        UtilityFunctions::printerr("[HW-FALLBACK] فشل فتح الديكودر البرمجي أيضًا — الفيديو سيتوقف.");
+        avcodec_free_context(&video_codec_ctx);
+        video_codec_ctx = nullptr;
+        // [STATE-MACHINE v7.10] حالة غير قابلة للتعافي — كانت فجوة سابقًا
+        // (لا إشارة خطأ، الفيديو يتجمّد بصمت). لا نستدعي emit_signal مباشرة
+        // هنا لأن هذه الدالة قد تُنفَّذ على خيط الفك الشبكي (غير آمن لإصدار
+        // إشارات Godot من خيط غير رئيسي) — نضبط علمًا ذريًا فقط؛ _process()
+        // على الخيط الرئيسي يكتشفه ويُصدر الإشارة الفعلية بأمان (نفس نمط
+        // network_read_error_flag الموجود أصلاً).
+        decoder_faulted = true;
+        return;
+    }
+
+    hw_decode_active     = false;
+    hw_decode_fail_count = 0;
+
+    // [HW-FALLBACK v7.9] تنسيق البكسل قد يختلف بين مخرجات العتاد والبرمجي —
+    // يجب إعادة إنشاء sws_ctx بالتنسيق الجديد بدل الاحتفاظ بالقديم الخاطئ.
+    if (sws_ctx) { sws_freeContext(sws_ctx); sws_ctx = nullptr; }
+
+    UtilityFunctions::print("[HW-FALLBACK] نجح التراجع — فك التشفير البرمجي نشط الآن.");
 }
 
 // ─── إعداد كودك الصوت ─────────────────────────────────────────────────────────
@@ -1351,6 +1490,7 @@ void FFmpegPlayer::play() {
         _emit_playback_error("No video loaded"); return;
     }
     playing = true; buffering = true; frame_timer = 0.0;
+    explicitly_stopped = false; // [STATE-MACHINE v7.10]
     _reset_audio_clock(position);
     _reset_last_audio_pts();
     if (is_inside_tree()) emit_signal("buffering_changed", true);
@@ -1363,11 +1503,13 @@ void FFmpegPlayer::play() {
 void FFmpegPlayer::pause() {
     if (!playing) return;
     playing = false; _pause_audio();
+    // [STATE-MACHINE v7.10] لا نضبط explicitly_stopped هنا — يبقى false
+    // (وضع PAUSED)، بعكس stop() أدناه (وضع STOPPED).
 }
 
 // ─── stop ─────────────────────────────────────────────────────────────────────
 void FFmpegPlayer::stop() {
-    playing = false; _stop_audio(); seek(0.0);
+    playing = false; explicitly_stopped = true; _stop_audio(); seek(0.0); // [STATE-MACHINE v7.10]
 }
 
 // ─── seek ─────────────────────────────────────────────────────────────────────
@@ -1391,8 +1533,11 @@ void FFmpegPlayer::seek(double seconds) {
         {
             std::lock_guard<std::mutex> lock(decoded_frame_mutex);
             while (!decoded_frame_queue.empty() &&
-                   decoded_frame_queue.front().pts < seconds)
+                   decoded_frame_queue.front().pts < seconds) {
+                // [OBJECT-POOL v7.8] أعد المخزن للمجمّع بدل تركه يُحرَّر
+                _release_frame_buffer(std::move(decoded_frame_queue.front().data));
                 decoded_frame_queue.pop_front();
+            }
         }
         // [6] مسح إطارات الصوت القديمة
         while (!decoded_audio_queue.empty()) {
@@ -1422,11 +1567,22 @@ void FFmpegPlayer::seek(double seconds) {
         network_seek_target_secs = seconds;
         network_seek_requested   = true;
 
-        // [DECODE-THREAD v7.6] نفس الأمر لخيط الفك — هو المالك الحصري لـ
-        // video_codec_ctx الآن، فلا نستدعي avcodec_flush_buffers من هنا
+        // [COMMAND-QUEUE v7.7] نفس الأمر لخيط الفك — بدل ضبط علم Atomic
+        // وحيد الغرض، نُرسل أمر التفريغ كإغلاق عبر الطابور العام. هو المالك
+        // الحصري لـ video_codec_ctx الآن، فلا نستدعي avcodec_flush_buffers هنا.
         if (decode_thread_active) {
-            decode_flush_done      = false;
-            decode_flush_requested = true;
+            decode_flush_done = false;
+            _post_decode_command([this]() {
+                if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
+                {
+                    std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+                    // [OBJECT-POOL v7.8] أعد كل المخازن للمجمّع قبل المسح
+                    for (auto &df : decoded_frame_queue)
+                        _release_frame_buffer(std::move(df.data));
+                    decoded_frame_queue.clear();
+                }
+                decode_flush_done = true;
+            });
         }
 
         // نفس الأمر للصوت الخارجي الشبكي إن كان نشطًا — يعالج نفسه بنفسه
@@ -1575,6 +1731,11 @@ void FFmpegPlayer::_process(double delta) {
         if (ext_network_read_error_flag.exchange(false)) {
             _emit_playback_error("External audio network read error — retrying in background...");
         }
+        // [STATE-MACHINE v7.10] فشل فك تشفير غير قابل للتعافي — إشارة واحدة
+        // فقط (decoder_faulted نفسه يبقى true دائمًا لأجل get_playback_state())
+        if (decoder_faulted && !decoder_fault_notified.exchange(true)) {
+            _emit_playback_error("Hardware and software video decoders both failed");
+        }
     }
 
     // التحقق الآمن من نجاح تحميل الصوت الشبكي في الخيط الرئيسي
@@ -1702,9 +1863,11 @@ void FFmpegPlayer::_process(double delta) {
             std::lock_guard<std::mutex> lock(decoded_frame_mutex);
             while (decoded_frame_queue.size() > 1) {
                 double frame_pts = decoded_frame_queue.front().pts;
-                if (audio_clk - frame_pts > HARD_DROP_THRESHOLD)
+                if (audio_clk - frame_pts > HARD_DROP_THRESHOLD) {
+                    // [OBJECT-POOL v7.8] أعد المخزن للمجمّع قبل الإسقاط
+                    _release_frame_buffer(std::move(decoded_frame_queue.front().data));
                     decoded_frame_queue.pop_front(); // اسقط الإطار المتأخر
-                else break;
+                } else break;
             }
         }
 
@@ -2016,7 +2179,8 @@ void FFmpegPlayer::_decode_packets_into_queue(bool greedy) {
 
             DecodedFrame df;
             df.pts = pts;
-            df.data.resize(video_width * video_height * 3);
+            // [OBJECT-POOL v7.8] إعادة استخدام مخزن جاهز بدل تخصيص جديد كامل
+            df.data = _acquire_frame_buffer(video_width * video_height * 3);
             memcpy(df.data.ptrw(), frame_buffer, df.data.size());
             decoded_frame_queue.push_back(std::move(df));
 
@@ -2025,6 +2189,7 @@ void FFmpegPlayer::_decode_packets_into_queue(bool greedy) {
                 first_frame_decoded_logged = true;
                 UtilityFunctions::print("[TIMING] أول إطار فيديو مفكوك بعد ", _elapsed_ms_since_load(), "ms");
             }
+            hw_decode_fail_count = 0; // [HW-FALLBACK v7.9] نجاح يُصفِّر عدّاد الفشل
 
             av_frame_unref(vf); continue;
         }
@@ -2041,8 +2206,8 @@ void FFmpegPlayer::_decode_packets_into_queue(bool greedy) {
             }
             if (!p) break;
             int sr = avcodec_send_packet(video_codec_ctx, p); av_packet_free(&p);
-            if (sr < 0 && sr != AVERROR(EAGAIN)) break;
-        } else break;
+            if (sr < 0 && sr != AVERROR(EAGAIN)) { _handle_decode_error(); break; } // [HW-FALLBACK v7.9]
+        } else { _handle_decode_error(); break; } // [HW-FALLBACK v7.9]
     }
     av_frame_free(&vf);
 }
@@ -2123,6 +2288,10 @@ bool FFmpegPlayer::_present_frame_at(double pos) {
 
             // إذا كان الإطار التالي قد حان موعده
             if (next_pts <= pos) {
+                // [OBJECT-POOL v7.8] أعد المخزن للمجمّع قبل إسقاط الإطار
+                // القديم. آمن حتى لو كان لا يزال مُشارَكًا (Copy-on-Write في
+                // PackedByteArray يحمي أي مرجع آخر تلقائيًا عند إعادة الكتابة).
+                _release_frame_buffer(std::move(decoded_frame_queue.front().data));
                 decoded_frame_queue.pop_front();
                 frames_dropped_this_tick++;
 
@@ -2146,9 +2315,14 @@ bool FFmpegPlayer::_present_frame_at(double pos) {
 
     if (!current_texture.is_valid() || f_data.is_empty()) return false;
 
-    // تحديث الصورة المعروضة
-    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, f_data);
-    current_texture->update(img);
+    // ── [OBJECT-POOL v7.8] إعادة استخدام كائن Image واحد بدل إنشاء جديد في
+    // كل إطار معروض (حتى 60 مرة/ثانية أثناء التشغيل الفعلي) ──────────────────
+    if (reusable_present_image.is_null()) {
+        reusable_present_image = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, f_data);
+    } else {
+        reusable_present_image->set_data(video_width, video_height, false, Image::FORMAT_RGB8, f_data);
+    }
+    current_texture->update(reusable_present_image);
     _emit_frame_updated();
 
     return true;
@@ -2185,6 +2359,18 @@ float FFmpegPlayer::get_buffer_status() {
     return p < 0.0f ? 0.0f : p;
 }
 
+// ─── [STATE-MACHINE v7.10 — خطوة 4] حالة تشغيل صريحة (للقراءة فقط) ──────────
+// دالة حساب بحتة — لا تُغيّر أي عضو، فقط تشتق حالة واضحة من الأعلام الداخلية
+// الموجودة فعليًا. آمنة تمامًا للاستدعاء من أي مكان (بما فيه GDScript) في
+// أي لحظة، دون أي أثر جانبي.
+int FFmpegPlayer::get_playback_state() const {
+    if (!fmt_ctx) return (int)PlaybackState::NONE;
+    if (decoder_faulted) return (int)PlaybackState::FAULTED;
+    if (buffering) return (int)PlaybackState::BUFFERING;
+    if (playing) return (int)PlaybackState::PLAYING;
+    return (int)(explicitly_stopped ? PlaybackState::STOPPED : PlaybackState::PAUSED);
+}
+
 // ─── [6] تنظيف كامل للطوابير ──────────────────────────────────────────────────
 void FFmpegPlayer::_clear_queues() {
     // [THREAD-SAFE v7.0] video_packet_queue/audio_packet_queue قد يُكتب
@@ -2205,6 +2391,9 @@ void FFmpegPlayer::_clear_queues() {
     // [DECODE-THREAD v7.6] decoded_frame_queue مشترك مع خيط الفك الآن
     {
         std::lock_guard<std::mutex> lock(decoded_frame_mutex);
+        // [OBJECT-POOL v7.8] أعد كل المخازن للمجمّع قبل المسح
+        for (auto &df : decoded_frame_queue)
+            _release_frame_buffer(std::move(df.data));
         decoded_frame_queue.clear();
     }
     forward_buffer_secs = 0.0;
@@ -2271,8 +2460,13 @@ void FFmpegPlayer::_cleanup() {
         decode_thread_active = false;
         if (decode_thread.joinable()) decode_thread.join();
     }
-    decode_flush_requested = false;
-    decode_flush_done      = false;
+    decode_flush_done = false;
+    // [COMMAND-QUEUE v7.7] تفريغ أي أوامر معلّقة لم تُنفَّذ بعد (نادر، لكن
+    // آمن دائمًا التأكد بعد إيقاف الخيط الذي كان سيُنفِّذها)
+    {
+        std::lock_guard<std::mutex> lock(decode_command_mutex);
+        decode_command_queue.clear();
+    }
 
     _clear_queues();
     _cleanup_ext_audio(); // يوقف ext_network_read_thread داخليًا أيضًا الآن
@@ -2287,6 +2481,14 @@ void FFmpegPlayer::_cleanup() {
 
     int_audio_generator.unref();
     int_audio_playback.unref();
+
+    // [OBJECT-POOL v7.8] تصفير المجمّع وكائن الصورة المُعاد استخدامه — الفيديو
+    // التالي قد يملك أبعادًا مختلفة، فلا فائدة من الاحتفاظ بمخازن بالحجم القديم
+    {
+        std::lock_guard<std::mutex> lock(frame_pool_mutex);
+        free_frame_buffers.clear();
+    }
+    reusable_present_image.unref();
 
     duration = 0.0; position = 0.0; forward_buffer_secs = 0.0;
     frame_timer = 0.0; status_timer = 0.0;
@@ -2307,6 +2509,12 @@ void FFmpegPlayer::_cleanup() {
     audio_active_source      = AudioActiveSource::NONE;
     external_audio_requested = false;
     external_audio_ready     = false;
+
+    // [STATE-MACHINE v7.10] إعادة ضبط لكل تحميل جديد — لا نحمل حالة فشل أو
+    // إيقاف من جلسة سابقة إلى فيديو جديد.
+    decoder_faulted         = false;
+    decoder_fault_notified  = false;
+    explicitly_stopped      = true; // فيديو محمَّل حديثًا يُعتبر "متوقفًا" حتى play()
 }
 
 // ─── الإشارات ─────────────────────────────────────────────────────────────────
